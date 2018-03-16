@@ -28,6 +28,10 @@ block-obj-y += backup.o
 block-obj-$(CONFIG_REPLICATION) += replication.o
 block-obj-y += throttle.o
 
+block-obj-y += zerodb.o
+zerodb.o-cflags := -I/usr/include/hiredis -Wno-redundant-decls
+zerodb.o-libs := -lhiredis
+
 block-obj-y += crypto.o
 
 common-obj-y += stream.o
