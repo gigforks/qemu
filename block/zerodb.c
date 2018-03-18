@@ -21,13 +21,16 @@
 typedef struct zdb_state_t {
     const char *host;
     const char *socket;
+    const char *namespace;
+    const char *password;
     int port;
     int64_t size;
     redisContext *redis;
+    uint64_t blocksize;
 
 } zdb_state_t;
 
-// #define DEBUG
+#define DEBUG
 
 #ifdef DEBUG
     #define zdb_debug printf
@@ -48,8 +51,11 @@ typedef struct zdb_state_t {
 #define ZDB_OPT_PORT "port"
 #define ZDB_OPT_SIZE "size"
 #define ZDB_OPT_SOCKET "socket"
+#define ZDB_OPT_BLOCKSIZE "blocksize"
+#define ZDB_OPT_NAMESPACE "namespace"
+#define ZDB_OPT_PASSWORD "password"
 
-#define ZDB_BLOCKSIZE  4096
+#define ZDB_DEFAULT_BLOCKSIZE  4096
 
 static QemuOptsList runtime_opts = {
     .name = "zdb",
@@ -70,12 +76,27 @@ static QemuOptsList runtime_opts = {
             .type = QEMU_OPT_STRING,
             .help = "zero-db unix socket",
         },
-
         {
             .name = BLOCK_OPT_SIZE,
             .type = QEMU_OPT_SIZE,
             .help = "size of the virtual disk size",
         },
+        {
+            .name = ZDB_OPT_BLOCKSIZE,
+            .type = QEMU_OPT_SIZE,
+            .help = "internal blocksize aggregation",
+        },
+        {
+            .name = ZDB_OPT_NAMESPACE,
+            .type = QEMU_OPT_STRING,
+            .help = "zero-db namespace to use",
+        },
+        {
+            .name = ZDB_OPT_PASSWORD,
+            .type = QEMU_OPT_STRING,
+            .help = "optional zero-db namespace password",
+        },
+
         { /* end of list */ }
     },
 };
@@ -90,26 +111,25 @@ typedef enum zdb_command_t {
 } zdb_command_t;
 
 typedef struct zdb_request_t {
-    zdb_command_t command; // requested command
+    zdb_command_t command;  // requested command
+    void *buffer;           // common buffer between qemu and driver
+    uint64_t start;         // start sector number
+    int sectors;            // number of sectors requested
+    uint64_t offset;        // real offset in bytes
+    uint64_t length;        // real length in bytes
 
-    void *buffer;       // common buffer between qemu and driver
-    uint64_t start;     // start sector number
-    int sectors;        // number of sectors requested
-    uint64_t offset;    // real offset in bytes
-    uint64_t length;    // real length in bytes
+    uint64_t first_block;   // first block id needed from the backend for this request
+    uint64_t last_block;    // last block id needed
 
-    uint64_t first_block;
-    uint64_t last_block;
-
-    QEMUIOVector *qiov;
+    QEMUIOVector *qiov;     // qemu io vector where to read/write data
 
 } zdb_request_t;
 
 typedef struct zdb_aio_cb_t {
-    BlockAIOCB common;
-    zdb_request_t request;
-    zdb_state_t *state;
-    int status;
+    BlockAIOCB common;      // common qemu blockdriver object
+    zdb_request_t request;  // copy of the request
+    zdb_state_t *state;     // object state
+    int status;             // return code
 
 } zdb_aio_cb_t;
 
@@ -125,68 +145,79 @@ static void zdb_aio_parse_filename(const char *filename, QDict *options, Error *
     }
 }
 
-static zdb_request_t zdb_request_new(uint64_t sector_num, int nb_sectors, QEMUIOVector *qiov, zdb_command_t command) {
-    zdb_request_t request;
-
-    request.command = command;
-    request.start = sector_num;
-    request.sectors = nb_sectors;
-    request.offset = sector_num * BDRV_SECTOR_SIZE;
-    request.length = nb_sectors * BDRV_SECTOR_SIZE;
-    request.qiov = qiov;
-    request.buffer = NULL;
-
-    zdb_debug("[+] zdb: request: %s\n", zdb_commands[request.command]);
-    zdb_debug("[+] zdb: request: sector %lu + %d\n", request.start, request.sectors);
-    zdb_debug("[+] zdb: request: offset %lu -> %lu\n", request.offset, request.length);
-
-    request.first_block = request.offset / ZDB_BLOCKSIZE;
-    request.last_block = ceil((request.offset + request.length) / ZDB_BLOCKSIZE);
-
-    zdb_debug("[+] zdb: internal blocks: %lu -> %lu\n", request.first_block, request.last_block);
-
-    // only write needs allocation
-    if(request.command != ZDB_COMMAND_WRITE)
-        return request;
-
-    if(!(request.buffer = malloc(ZDB_BLOCKSIZE)))
-        request.command = ZDB_COMMAND_FAILED;
-
-    return request;
-}
-
-static void zdb_request_free(zdb_request_t *request) {
-    free(request->buffer);
-}
-
-static int zdb_connect(zdb_state_t *state, Error **errp) {
+static int zdb_connect_tcp(zdb_state_t *state, Error **errp) {
     struct timeval timeout = {5, 0};
 
-    if(state->socket) {
-        zdb_debug("[+] connecting zero-db server: %s\n", state->socket);
-        state->redis = redisConnectUnix(state->socket);
+    zdb_debug("[+] connecting zero-db server: %s:%d\n", state->host, state->port);
+    state->redis = redisConnectWithTimeout(state->host, state->port, timeout);
 
-    } else {
-        zdb_debug("[+] connecting zero-db server: %s:%d\n", state->host, state->port);
-        state->redis = redisConnectWithTimeout(state->host, state->port, timeout);
-    }
-
-    if(state->redis == NULL || state->redis->err) {
+    if(!state->redis || state->redis->err) {
         const char *error = (state->redis->err) ? state->redis->errstr : "memory error";
 
-        printf("[-] zdb: redis: %s\n", error);
+        zdb_debug("[-] zdb: hiredis: memory allocation issue\n");
         error_setg(errp, "zero-db [%s:%d]: %s", state->host, state->port, error);
         return 1;
     }
 
+    return 0;
+}
+
+static int zdb_connect_unix(zdb_state_t *state, Error **errp) {
+    zdb_debug("[+] connecting zero-db server: %s\n", state->socket);
+    state->redis = redisConnectUnix(state->socket);
+
+    if(!state->redis || state->redis->err) {
+        const char *error = (state->redis->err) ? state->redis->errstr : "memory error";
+
+        zdb_debug("[-] zdb: hiredis: memory allocation issue\n");
+        error_setg(errp, "zero-db [%s]: %s", state->socket, error);
+        return 1;
+    }
+
+    return 0;
+}
+
+static int zdb_connect(zdb_state_t *state, Error **errp) {
+    int value;
+    redisReply *reply;
+
+    if(state->socket) {
+        if((value = zdb_connect_unix(state, errp)))
+            return value;
+
+    } else {
+        if((value = zdb_connect_tcp(state, errp)))
+            return value;
+    }
+
     // ping redis to ensure connection
-    redisReply *reply = redisCommand(state->redis, "PING");
+    reply = redisCommand(state->redis, "PING");
     if(strcmp(reply->str, "PONG"))
         fprintf(stderr, "[-] zdb: warning, invalid redis PING response: %s\n", reply->str);
 
     freeReplyObject(reply);
 
     zdb_debug("[+] zdb: zero-db connected\n");
+
+    if(state->namespace) {
+        zdb_debug("[+] zdb: switching to namespace: %s\n", state->namespace);
+
+        if(state->password) {
+            // select namespace, without password
+            reply = redisCommand(state->redis, "SELECT %s %s", state->namespace, state->password);
+
+        } else {
+            // select namespace, with password
+            reply = redisCommand(state->redis, "SELECT %s", state->namespace);
+        }
+
+        if(reply->type == REDIS_REPLY_ERROR) {
+            fprintf(stderr, "[-] zdb: namespace: %s\n", reply->str);
+            error_setg(errp, "zero-db [%s]: namespace: %s", state->socket, reply->str);
+        }
+
+        freeReplyObject(reply);
+    }
 
     return 0;
 }
@@ -203,13 +234,16 @@ static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error 
         s->host = "localhost";
 
     s->socket = qemu_opt_get(opts, ZDB_OPT_SOCKET);
+    s->namespace = qemu_opt_get(opts, ZDB_OPT_NAMESPACE);
+    s->password = qemu_opt_get(opts, ZDB_OPT_PASSWORD);
     s->port = qemu_opt_get_number(opts, ZDB_OPT_PORT, 9900);
     s->size = qemu_opt_get_size(opts, BLOCK_OPT_SIZE, 1 << 30);
+    s->blocksize = qemu_opt_get_size(opts, ZDB_OPT_BLOCKSIZE, ZDB_DEFAULT_BLOCKSIZE);
 
     zdb_debug("[+] zdb: host: %s\n", s->socket ? s->socket : s->host);
     zdb_debug("[+] zdb: port: %d\n", s->port);
     zdb_debug("[+] zdb: size: %lu (%.2f MB)\n", s->size, s->size / (1024 * 1024.0));
-    zdb_debug("[+] zdb: blocksize: %d\n", ZDB_BLOCKSIZE);
+    zdb_debug("[+] zdb: blocksize: %lu\n", s->blocksize);
 
     // qemu_opts_del(opts);
 
@@ -231,11 +265,70 @@ static int64_t zdb_getlength(BlockDriverState *bs) {
 }
 
 //
+// zero-db request
+//
+static zdb_request_t zdb_request_new(zdb_state_t *state, uint64_t sector, int sectors, QEMUIOVector *qiov, zdb_command_t command) {
+    zdb_request_t request;
+
+    request.command = command;
+    request.start = sector;
+    request.sectors = sectors;
+    request.offset = sector * BDRV_SECTOR_SIZE;
+    request.length = sectors * BDRV_SECTOR_SIZE;
+    request.qiov = qiov;
+    request.buffer = NULL;
+
+    zdb_debug("[+] zdb: request: %s\n", zdb_commands[request.command]);
+    zdb_debug("[+] zdb: request: sector %lu + %d\n", request.start, request.sectors);
+    zdb_debug("[+] zdb: request: offset %lu -> %lu\n", request.offset, request.length);
+
+    request.first_block = request.offset / state->blocksize;
+    request.last_block = ceil((request.offset + request.length) / (double) state->blocksize);
+
+    // we use a loop from the first block to the last block on the write
+    // if we only touch a single block, the loop won't do anything
+    // in this special case, we force the last block to be at least one later
+    if(request.last_block == request.first_block)
+        request.last_block += 1;
+
+    zdb_debug("[+] zdb: internal blocks: %lu -> %lu\n", request.first_block, request.last_block);
+
+    // only write needs allocation
+    if(request.command != ZDB_COMMAND_WRITE)
+        return request;
+
+    if(!(request.buffer = malloc(state->blocksize)))
+        request.command = ZDB_COMMAND_FAILED;
+
+    return request;
+}
+
+static void zdb_request_free(zdb_request_t *request) {
+    free(request->buffer);
+}
+
+//
 // zero-db input/output
 //
 static inline redisReply *zdb_read_block(zdb_aio_cb_t *acb, uint64_t blockid) {
     uint64_t key = htobe64(blockid);
-    return redisCommand(acb->state->redis, "GET %b", &key, sizeof(key));
+    redisReply *reply;
+
+    reply = redisCommand(acb->state->redis, "GET %b", &key, sizeof(key));
+
+    if(!reply) {
+        zdb_debug("[-] zdb: read: cannot perform request: %s\n", acb->state->redis->errstr);
+        // ...
+    }
+
+    // reply exists but length is not expected blocksize
+    // this block is corrupted or not what we expected
+    if(reply->len > 0 && reply->len != acb->state->blocksize) {
+        zdb_debug("[-] zdb: read: wrong blocksize read (%u, expected %lu)\n", reply->len, acb->state->blocksize);
+        return NULL;
+    }
+
+    return reply;
 }
 
 static inline void zdb_free_block(redisReply *reply) {
@@ -244,14 +337,25 @@ static inline void zdb_free_block(redisReply *reply) {
 
 static inline int zdb_write_block(zdb_aio_cb_t *acb, uint64_t blockid, void *payload) {
     uint64_t key = htobe64(blockid);
+    int value = 0;
     redisReply *reply;
 
-    reply = redisCommand(acb->state->redis, "SET %b %b", &key, sizeof(key), payload, ZDB_BLOCKSIZE);
+    reply = redisCommand(acb->state->redis, "SET %b %b", &key, sizeof(key), payload, acb->state->blocksize);
+    if(!reply) {
+        zdb_debug("[-] zdb: read: cannot perform request: %s\n", acb->state->redis->errstr);
+        // ...
+    }
+
+    if(reply->type != REDIS_REPLY_STATUS) {
+        zdb_debug("[-] zdb: write: wrong response type from server\n");
+        value = 1;
+    }
+
     // should check reply
 
     freeReplyObject(reply);
 
-    return 0;
+    return value;
 }
 
 //
@@ -260,6 +364,7 @@ static inline int zdb_write_block(zdb_aio_cb_t *acb, uint64_t blockid, void *pay
 static void zdb_bh_cb(void *opaque) {
     zdb_aio_cb_t *acb = opaque;
     zdb_request_t *request = &acb->request;
+    uint64_t blocksize = acb->state->blocksize;
 
     zdb_debug("[+] zdb: callback: command: %d\n", request->command);
     zdb_debug("[+] zdb: request bytes: %lu -> %lu\n", request->offset, request->offset + request->length);
@@ -283,17 +388,26 @@ static void zdb_bh_cb(void *opaque) {
             uint64_t iopos = 0;                 // current position in the iovector
             uint64_t remain = request->length;  // amount of data which remains to write
 
-            for(uint64_t block = request->first_block; block <= request->last_block; block += 1) {
-                zdb_debug("[+] zdb: processing read: block %lu\n", block);
+            for(uint64_t block = request->first_block; block < request->last_block; block += 1) {
+                zdb_debug("[+] zdb: processing read: block %lu, remain %lu\n", block, remain);
 
                 // reading the block, we need it anyway
                 redisReply *payload = zdb_read_block(acb, block);
+                if(!payload) {
+                    acb->status = -EIO;
+                    goto final;
+                }
 
-                uint64_t buffer_offset = (current % ZDB_BLOCKSIZE);       // position to the buffer
-                uint64_t buffer_length = (ZDB_BLOCKSIZE - buffer_offset); // amount of data to put on the buffer
+                uint64_t buffer_offset = (current % blocksize);       // position to the buffer
+                uint64_t buffer_length = (blocksize - buffer_offset); // amount of data to put on the buffer
+
+                zdb_debug("[+] zdb: read: partial offset: %lu\n", buffer_offset);
+                zdb_debug("[+] zdb: read: partial length: %lu\n", buffer_length);
 
                 if(buffer_length > remain)
                     buffer_length = remain;
+
+                zdb_debug("[+] zdb: read: partial length corrected: %lu\n", buffer_length);
 
                 if(payload->str) {
                     // fillin data with the buffer
@@ -366,26 +480,31 @@ static void zdb_bh_cb(void *opaque) {
                 // checking if sector is aligned with the beginin of the block
                 // or if the amount of sectors to write is smaller then the block
                 // in theses both case, we need to fetch the block and update it
-                if(current % ZDB_BLOCKSIZE || remain < ZDB_BLOCKSIZE) {
+                if(current % acb->state->blocksize || remain < acb->state->blocksize) {
                     zdb_debug("[+] zdb: partial write, need to read the block\n");
-                    zdb_debug("[+] zdb: begin: %lu, remain: %lu > %lu\n", current % ZDB_BLOCKSIZE, current + ZDB_BLOCKSIZE, remain);
+                    zdb_debug("[+] zdb: begin: %lu, remain: %lu in %lu block\n", current % blocksize, remain, current + blocksize);
 
-                    uint64_t buffer_offset = (current % ZDB_BLOCKSIZE);       // position to the buffer
-                    uint64_t buffer_length = (ZDB_BLOCKSIZE - buffer_offset); // amount of data to put on the buffer
+                    uint64_t buffer_offset = (current % blocksize);       // position to the buffer
+                    uint64_t buffer_length = (blocksize - buffer_offset); // amount of data to put on the buffer
 
-                    printf("Offset: %lu\n", buffer_offset);
-                    printf("Length: %lu\n", buffer_length);
+                    zdb_debug("[+] zdb: write: partial offset: %lu\n", buffer_offset);
+                    zdb_debug("[+] zdb: write: partial length: %lu\n", buffer_length);
 
                     // fetching the block from the backend
                     redisReply *existing = zdb_read_block(acb, block);
+                    if(!existing) {
+                        // if existing is not set, block was not correctly read
+                        acb->status = -EIO;
+                        goto final;
+                    }
 
                     if(existing->str) {
                         // key was existing, moving the payload to the buffer
-                        memcpy(request->buffer, existing->str, ZDB_BLOCKSIZE);
+                        memcpy(request->buffer, existing->str, blocksize);
 
                     } else {
                         // key not found, we need to start from an empty block
-                        memset(request->buffer, 0x00, ZDB_BLOCKSIZE);
+                        memset(request->buffer, 0x00, blocksize);
                     }
 
                     // if the buffer length is greater than the remaining amount
@@ -412,12 +531,12 @@ static void zdb_bh_cb(void *opaque) {
                 // here, we know we can blindly overwrite the full block because
                 // the current write offset alignes with the begenin of one block and
                 // a full block is not larger than the remaining data
-                qemu_iovec_to_buf(request->qiov, iopos, request->buffer, ZDB_BLOCKSIZE);
+                qemu_iovec_to_buf(request->qiov, iopos, request->buffer, blocksize);
                 zdb_write_block(acb, block, request->buffer);
 
-                iopos += ZDB_BLOCKSIZE;
-                current += ZDB_BLOCKSIZE;
-                remain -= ZDB_BLOCKSIZE;
+                iopos += blocksize;
+                current += blocksize;
+                remain -= blocksize;
             }
         } break;
 
@@ -431,6 +550,7 @@ static void zdb_bh_cb(void *opaque) {
         break;
     }
 
+final:
     acb->common.cb(acb->common.opaque, acb->status);
 
     zdb_request_free(request);
@@ -451,18 +571,21 @@ static inline BlockAIOCB *zdb_aio_common(BlockDriverState *bs, BlockCompletionFu
     return &acb->common;
 }
 
-static BlockAIOCB *zdb_aio_readv(BlockDriverState *bs, int64_t sector_num, QEMUIOVector *qiov, int nb_sectors, BlockCompletionFunc *cb, void *opaque) {
-    zdb_request_t request = zdb_request_new(sector_num, nb_sectors, qiov, ZDB_COMMAND_READ);
+static BlockAIOCB *zdb_aio_readv(BlockDriverState *bs, int64_t sector, QEMUIOVector *qiov, int sectors, BlockCompletionFunc *cb, void *opaque) {
+    zdb_state_t *s = bs->opaque;
+    zdb_request_t request = zdb_request_new(s, sector, sectors, qiov, ZDB_COMMAND_READ);
     return zdb_aio_common(bs, cb, opaque, request);
 }
 
-static BlockAIOCB *zdb_aio_writev(BlockDriverState *bs, int64_t sector_num, QEMUIOVector *qiov, int nb_sectors, BlockCompletionFunc *cb, void *opaque) {
-    zdb_request_t request = zdb_request_new(sector_num, nb_sectors, qiov, ZDB_COMMAND_WRITE);
+static BlockAIOCB *zdb_aio_writev(BlockDriverState *bs, int64_t sector, QEMUIOVector *qiov, int sectors, BlockCompletionFunc *cb, void *opaque) {
+    zdb_state_t *s = bs->opaque;
+    zdb_request_t request = zdb_request_new(s, sector, sectors, qiov, ZDB_COMMAND_WRITE);
     return zdb_aio_common(bs, cb, opaque, request);
 }
 
 static BlockAIOCB *zdb_aio_flush(BlockDriverState *bs, BlockCompletionFunc *cb, void *opaque) {
-    zdb_request_t request = zdb_request_new(0, 0, NULL, ZDB_COMMAND_FLUSH);
+    zdb_state_t *s = bs->opaque;
+    zdb_request_t request = zdb_request_new(s, 0, 0, NULL, ZDB_COMMAND_FLUSH);
     return zdb_aio_common(bs, cb, opaque, request);
 }
 
