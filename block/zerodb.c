@@ -154,8 +154,11 @@ static int zdb_connect_tcp(zdb_state_t *state, Error **errp) {
     if(!state->redis || state->redis->err) {
         const char *error = (state->redis->err) ? state->redis->errstr : "memory error";
 
-        zdb_debug("[-] zdb: hiredis: memory allocation issue\n");
-        error_setg(errp, "zero-db [%s:%d]: %s", state->host, state->port, error);
+        zdb_debug("[-] zdb: hiredis: %s\n", error);
+
+        if(errp)
+            error_setg(errp, "zero-db [%s:%d]: %s", state->host, state->port, error);
+
         return 1;
     }
 
@@ -169,8 +172,11 @@ static int zdb_connect_unix(zdb_state_t *state, Error **errp) {
     if(!state->redis || state->redis->err) {
         const char *error = (state->redis->err) ? state->redis->errstr : "memory error";
 
-        zdb_debug("[-] zdb: hiredis: memory allocation issue\n");
-        error_setg(errp, "zero-db [%s]: %s", state->socket, error);
+        zdb_debug("[-] zdb: hiredis: %s\n", error);
+
+        if(errp)
+            error_setg(errp, "zero-db [%s]: %s", state->socket, error);
+
         return 1;
     }
 
@@ -220,6 +226,11 @@ static int zdb_connect(zdb_state_t *state, Error **errp) {
     }
 
     return 0;
+}
+
+static int zdb_reconnect(zdb_state_t *state) {
+    redisFree(state->redis);
+    return zdb_connect(state, NULL);
 }
 
 static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error **errp) {
@@ -310,21 +321,41 @@ static void zdb_request_free(zdb_request_t *request) {
 //
 // zero-db input/output
 //
+
+// declaration used because of circular calls
+static inline redisReply *zdb_read_block(zdb_aio_cb_t *acb, uint64_t blockid);
+static inline int zdb_write_block(zdb_aio_cb_t *acb, uint64_t blockid, void *payload);
+
+static inline redisReply *zdb_read_block_issue(zdb_aio_cb_t *acb, uint64_t blockid) {
+    // if reconnect works, retry
+    if(zdb_reconnect(acb->state) == 0)
+        return zdb_read_block(acb, blockid);
+
+    acb->status = -EBUSY;
+    return NULL;
+}
+
 static inline redisReply *zdb_read_block(zdb_aio_cb_t *acb, uint64_t blockid) {
     uint64_t key = htobe64(blockid);
     redisReply *reply;
 
-    reply = redisCommand(acb->state->redis, "GET %b", &key, sizeof(key));
+    // does the connection is still alive
+    if(!acb->state->redis) {
+        acb->status = -EIO;
+        return NULL;
+    }
 
-    if(!reply) {
+    // performing request
+    if(!(reply = redisCommand(acb->state->redis, "GET %b", &key, sizeof(key)))) {
         zdb_debug("[-] zdb: read: cannot perform request: %s\n", acb->state->redis->errstr);
-        // ...
+        return zdb_read_block_issue(acb, blockid);
     }
 
     // reply exists but length is not expected blocksize
     // this block is corrupted or not what we expected
     if(reply->len > 0 && reply->len != acb->state->blocksize) {
         zdb_debug("[-] zdb: read: wrong blocksize read (%u, expected %lu)\n", reply->len, acb->state->blocksize);
+        acb->status = -EIO;
         return NULL;
     }
 
@@ -337,25 +368,33 @@ static inline void zdb_free_block(redisReply *reply) {
 
 static inline int zdb_write_block(zdb_aio_cb_t *acb, uint64_t blockid, void *payload) {
     uint64_t key = htobe64(blockid);
-    int value = 0;
     redisReply *reply;
 
-    reply = redisCommand(acb->state->redis, "SET %b %b", &key, sizeof(key), payload, acb->state->blocksize);
-    if(!reply) {
-        zdb_debug("[-] zdb: read: cannot perform request: %s\n", acb->state->redis->errstr);
-        // ...
+    if(!acb->state->redis) {
+        acb->status = -EIO;
+        return acb->status;
     }
 
-    if(reply->type != REDIS_REPLY_STATUS) {
+    if(!(reply = redisCommand(acb->state->redis, "SET %b %b", &key, sizeof(key), payload, acb->state->blocksize))) {
+        zdb_debug("[-] zdb: write: cannot perform request: %s\n", acb->state->redis->errstr);
+
+        // if reconnect works, retry
+        if(zdb_reconnect(acb->state) == 0)
+            return zdb_write_block(acb, blockid, payload);
+
+        acb->status = -EBUSY;
+        return acb->status;
+    }
+
+    if(reply->type != REDIS_REPLY_STRING) {
+        zdb_debug("reply %d\n", reply->type);
         zdb_debug("[-] zdb: write: wrong response type from server\n");
-        value = 1;
+        acb->status = -EIO;
     }
-
-    // should check reply
 
     freeReplyObject(reply);
 
-    return value;
+    return acb->status;
 }
 
 //
@@ -394,7 +433,7 @@ static void zdb_bh_cb(void *opaque) {
                 // reading the block, we need it anyway
                 redisReply *payload = zdb_read_block(acb, block);
                 if(!payload) {
-                    acb->status = -EIO;
+                    // acb->status = -EIO;
                     goto final;
                 }
 
@@ -494,7 +533,7 @@ static void zdb_bh_cb(void *opaque) {
                     redisReply *existing = zdb_read_block(acb, block);
                     if(!existing) {
                         // if existing is not set, block was not correctly read
-                        acb->status = -EIO;
+                        // acb->status = -EIO;
                         goto final;
                     }
 
