@@ -1,5 +1,6 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/qmp/qnum.h"
 #include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qstring.h"
 #include "qemu/option.h"
@@ -54,6 +55,8 @@ typedef struct zdb_state_t {
 #define ZDB_OPT_BLOCKSIZE "blocksize"
 #define ZDB_OPT_NAMESPACE "namespace"
 #define ZDB_OPT_PASSWORD "password"
+
+#define ZDB_OPT_PORT_DEFAULT 9900
 
 #define ZDB_DEFAULT_BLOCKSIZE  4096
 
@@ -133,15 +136,146 @@ typedef struct zdb_aio_cb_t {
 
 } zdb_aio_cb_t;
 
+typedef struct key_value_t {
+    char *key;
+    char *value;
+    const char *remain;
+
+} key_value_t;
+
 static const AIOCBInfo null_aiocb_info = {
     .aiocb_size = sizeof(zdb_aio_cb_t),
 };
 
+static key_value_t zdb_next_key_value(const char *input) {
+    char *match = NULL;
+    size_t length;
+    key_value_t kv = {
+        .key = NULL,
+        .value = NULL,
+        .remain = NULL,
+    };
+
+    // do we have any key/value pair
+    if(!(match = strchr(input, '=')))
+        return kv;
+
+    kv.key = strndup(input, match - input);
+
+    length = strlen(input + (match - input) + 1);
+    input = match + 1;
+
+    // do we have another option after this one
+    if((match = strchr(input, ',')))
+        length = match - input;
+
+    kv.value = strndup(input, length);
+
+    // do we have anything remaining after that
+    if(length)
+        kv.remain = input + length + 1;
+
+    return kv;
+}
+
+static void key_value_free(key_value_t *kv) {
+    free(kv->key);
+    free(kv->value);
+}
+
+// filename format:
+// zdb://                                    -- all default option
+//
+// zdb://remote-addr                         -- tcp remote server, default port
+// zdb://remote-addr:port                    -- tcp remote server, specific port
+// zdb://unix:/tmp/unix.socket               -- unix socket path
+// zdb://[socket],namespace=[namespace]      -- namespace option
+//            ...,password=[password]        -- namespace password
+//            ...,blocksize=[blocksize]      -- blocksize to use
 
 static void zdb_aio_parse_filename(const char *filename, QDict *options, Error **errp) {
-    if(strcmp(filename, "zdb://")) {
-        error_setg(errp, "The only allowed filename for this driver is 'zdb://'");
+    const char *str = NULL;
+    char *match = NULL, *limits = NULL;
+    char *value = NULL;
+    size_t length, copy;
+
+    if(strncmp(filename, "zdb://", 6) != 0) {
+        error_setg(errp, "Protocol should starts with zdb://'");
         return;
+    }
+
+    if((length = strlen(filename)) == 6) {
+        // nothing to parse, default option for everything
+        return;
+    }
+
+    // unix socket
+    if(strncmp(filename + 6, "unix:", 4) == 0) {
+        str = filename + 11;
+        copy = length;
+
+        if((limits = strchr(str, ',')))
+            copy = limits - str;
+
+        value = strndup(str, copy);
+        qdict_put(options, ZDB_OPT_SOCKET, qstring_from_str(value));
+
+    } else {
+        str = filename + 6;
+        copy = length;
+
+        // classic tcp path
+        if((limits = strchr(str, ',')))
+            copy = limits - str;
+
+        value = strndup(str, copy);
+        if((match = strchr(value, ':'))) {
+            int port = atoi(match + 1);
+
+            if(port == 0)
+                port = ZDB_OPT_PORT_DEFAULT;
+
+            qdict_put(options, ZDB_OPT_PORT, qnum_from_int(port));
+            *match = '\0';
+        }
+
+        if(strlen(value) > 0)
+            qdict_put(options, ZDB_OPT_HOST, qstring_from_str(value));
+    }
+
+    // no more options
+    if(!(match = strchr(str, ',')))
+        return;
+
+    str = match + 1;
+
+    while(1) {
+        key_value_t kv = zdb_next_key_value(str);
+
+        // no key, nothing found, we are done
+        if(!kv.key)
+            return;
+
+        if(strcmp(kv.key, ZDB_OPT_NAMESPACE) == 0) {
+            qdict_put(options, ZDB_OPT_NAMESPACE, qstring_from_str(kv.value));
+
+        } else if(strcmp(kv.key, ZDB_OPT_PASSWORD) == 0) {
+            qdict_put(options, ZDB_OPT_PASSWORD, qstring_from_str(kv.value));
+
+        } else if(strcmp(kv.key, ZDB_OPT_BLOCKSIZE) == 0) {
+            qdict_put(options, ZDB_OPT_BLOCKSIZE, qstring_from_str(kv.value));
+
+        } else {
+            error_setg(errp, "Unknown option '%s'", kv.key);
+        }
+
+        key_value_free(&kv);
+
+        // nothing left on the string
+        if(!kv.remain)
+            return;
+
+        str = kv.remain;
     }
 }
 
@@ -247,7 +381,7 @@ static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error 
     s->socket = qemu_opt_get(opts, ZDB_OPT_SOCKET);
     s->namespace = qemu_opt_get(opts, ZDB_OPT_NAMESPACE);
     s->password = qemu_opt_get(opts, ZDB_OPT_PASSWORD);
-    s->port = qemu_opt_get_number(opts, ZDB_OPT_PORT, 9900);
+    s->port = qemu_opt_get_number(opts, ZDB_OPT_PORT, ZDB_OPT_PORT_DEFAULT);
     s->size = qemu_opt_get_size(opts, BLOCK_OPT_SIZE, 1 << 30);
     s->blocksize = qemu_opt_get_size(opts, ZDB_OPT_BLOCKSIZE, ZDB_DEFAULT_BLOCKSIZE);
 
@@ -255,6 +389,8 @@ static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error 
     zdb_debug("[+] zdb: port: %d\n", s->port);
     zdb_debug("[+] zdb: size: %lu (%.2f MB)\n", s->size, s->size / (1024 * 1024.0));
     zdb_debug("[+] zdb: blocksize: %lu\n", s->blocksize);
+    zdb_debug("[+] zdb: namespace: %s\n", s->namespace ? s->namespace : "(not set)");
+    zdb_debug("[+] zdb: password: %s\n", s->password ? "(hidden)" : "(not set)");
 
     // qemu_opts_del(opts);
 
@@ -644,6 +780,24 @@ static void zdb_refresh_filename(BlockDriverState *bs, QDict *opts) {
     bs->full_open_options = opts;
 }
 
+static int coroutine_fn zdb_co_create(BlockdevCreateOptions *create_options, Error **errp) {
+    zdb_debug("[+] zdb: image creation in early stage\n");
+    return 0;
+}
+
+static int coroutine_fn zdb_co_create_opts(const char *filename, QemuOpts *opts, Error **errp) {
+    zdb_debug("[+] zdb: image creation in early stage\n");
+    return 0;
+}
+
+static QemuOptsList zdb_create_opts = {
+    .name = "zdb-create-opts",
+    .head = QTAILQ_HEAD_INITIALIZER(zdb_create_opts.head),
+    .desc = {
+        {/* end if list */}
+    }
+};
+
 static BlockDriver bdrv_zdb_aio = {
     .format_name            = "zdb",
     .protocol_name          = "zdb",
@@ -661,7 +815,11 @@ static BlockDriver bdrv_zdb_aio = {
     .bdrv_reopen_prepare    = zdb_reopen_prepare,
     .bdrv_refresh_filename  = zdb_refresh_filename,
 
-    // .bdrv_co_block_status   = null_co_block_status,
+    .bdrv_co_create         = zdb_co_create,
+    .create_opts            = &zdb_create_opts,
+    .bdrv_co_create_opts    = zdb_co_create_opts,
+
+    .bdrv_has_zero_init     = bdrv_has_zero_init_1,
 };
 
 static void bdrv_zdb_init(void) {
