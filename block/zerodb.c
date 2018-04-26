@@ -166,7 +166,7 @@ static key_value_t zdb_next_key_value(const char *input) {
     input = match + 1;
 
     // do we have another option after this one
-    if((match = strchr(input, ',')))
+    if((match = strchr(input, '&')))
         length = match - input;
 
     kv.value = strndup(input, length);
@@ -189,9 +189,14 @@ static void key_value_free(key_value_t *kv) {
 // zdb://remote-addr                         -- tcp remote server, default port
 // zdb://remote-addr:port                    -- tcp remote server, specific port
 // zdb://unix:/tmp/unix.socket               -- unix socket path
-// zdb://[socket],namespace=[namespace]      -- namespace option
-//            ...,password=[password]        -- namespace password
-//            ...,blocksize=[blocksize]      -- blocksize to use
+// zdb://[socket]?namespace=[namespace]      -- namespace option
+//            ...?password=[password]        -- namespace password
+//            ...?blocksize=[blocksize]      -- blocksize to use
+//
+//            -- multiple arguments:
+//            ...?namespace=[namespace]&size=[size]
+//
+// this follow classic uri system: schema://target?arg=val&arg2=val2
 
 static void zdb_aio_parse_filename(const char *filename, QDict *options, Error **errp) {
     const char *str = NULL;
@@ -214,7 +219,7 @@ static void zdb_aio_parse_filename(const char *filename, QDict *options, Error *
         str = filename + 11;
         copy = length;
 
-        if((limits = strchr(str, ',')))
+        if((limits = strchr(str, '&')))
             copy = limits - str;
 
         value = strndup(str, copy);
@@ -225,7 +230,7 @@ static void zdb_aio_parse_filename(const char *filename, QDict *options, Error *
         copy = length;
 
         // classic tcp path
-        if((limits = strchr(str, ',')))
+        if((limits = strchr(str, '&')))
             copy = limits - str;
 
         value = strndup(str, copy);
@@ -244,30 +249,41 @@ static void zdb_aio_parse_filename(const char *filename, QDict *options, Error *
     }
 
     // no more options
-    if(!(match = strchr(str, ',')))
+    if(!(match = strchr(str, '?')))
         return;
 
     str = match + 1;
 
+    // list of supported options
+    const char *supported[] = {
+        ZDB_OPT_NAMESPACE,
+        ZDB_OPT_PASSWORD,
+        ZDB_OPT_BLOCKSIZE,
+        ZDB_OPT_SIZE
+    };
+
     while(1) {
+        int valid = 0;
         key_value_t kv = zdb_next_key_value(str);
 
         // no key, nothing found, we are done
         if(!kv.key)
             return;
 
-        if(strcmp(kv.key, ZDB_OPT_NAMESPACE) == 0) {
-            qdict_put(options, ZDB_OPT_NAMESPACE, qstring_from_str(kv.value));
+        zdb_debug(">> %s\n", kv.key);
 
-        } else if(strcmp(kv.key, ZDB_OPT_PASSWORD) == 0) {
-            qdict_put(options, ZDB_OPT_PASSWORD, qstring_from_str(kv.value));
-
-        } else if(strcmp(kv.key, ZDB_OPT_BLOCKSIZE) == 0) {
-            qdict_put(options, ZDB_OPT_BLOCKSIZE, qstring_from_str(kv.value));
-
-        } else {
-            error_setg(errp, "Unknown option '%s'", kv.key);
+        // testing all keys agains all options we supports
+        for(unsigned int i = 0; i < sizeof(supported) / sizeof(char *); i++) {
+            if(strcmp(kv.key, supported[i]) == 0) {
+                // argument accepted
+                qdict_put(options, supported[i], qstring_from_str(kv.value));
+                valid = 1;
+                break;
+            }
         }
+
+        if(!valid)
+            error_setg(errp, "Unknown option '%s'", kv.key);
 
         key_value_free(&kv);
 
@@ -477,6 +493,7 @@ static inline redisReply *zdb_read_block(zdb_aio_cb_t *acb, uint64_t blockid) {
 
     // does the connection is still alive
     if(!acb->state->redis) {
+        zdb_debug("[-] zdb_read_block: connection died\n");
         acb->status = -EIO;
         return NULL;
     }
