@@ -31,6 +31,22 @@ typedef struct zdb_state_t {
 
 } zdb_state_t;
 
+typedef struct zdb_drv_t {
+    // read servers available
+    // (thin-provisioning)
+    size_t readlen;
+    zdb_state_t **readsrv;
+
+    // write servers available
+    // (active-backup)
+    size_t writelen;
+    zdb_state_t **writesrv;
+
+    // note: there are always at least
+    // one of each, which is the general zdb
+
+} zdb_drv_t;
+
 #define DEBUG
 
 #ifdef DEBUG
@@ -56,49 +72,53 @@ typedef struct zdb_state_t {
 #define ZDB_OPT_NAMESPACE "namespace"
 #define ZDB_OPT_PASSWORD "password"
 
+// thin-provisioning options
+// blocksize needs to match
+#define ZDB_OPT_THIN_HOST "thin-host"
+#define ZDB_OPT_THIN_PORT "thin-port"
+#define ZDB_OPT_THIN_SOCKET "thin-socket"
+#define ZDB_OPT_THIN_NAMESPACE "thin-namespace"
+#define ZDB_OPT_THIN_PASSWORD "thin-password"
+
+// active-active backup option
+// blocksize needs to match
+#define ZDB_OPT_BACKUP_HOST "backup-host"
+#define ZDB_OPT_BACKUP_PORT "backup-port"
+#define ZDB_OPT_BACKUP_SOCKET "backup-socket"
+#define ZDB_OPT_BACKUP_NAMESPACE "backup-namespace"
+#define ZDB_OPT_BACKUP_PASSWORD "backup-password"
+
 #define ZDB_OPT_PORT_DEFAULT 9900
 
 #define ZDB_DEFAULT_BLOCKSIZE  4096
+
 
 static QemuOptsList runtime_opts = {
     .name = "zdb",
     .head = QTAILQ_HEAD_INITIALIZER(runtime_opts.head),
     .desc = {
-        {
-            .name = ZDB_OPT_HOST,
-            .type = QEMU_OPT_STRING,
-            .help = "zero-db host",
-        },
-        {
-            .name = ZDB_OPT_PORT,
-            .type = QEMU_OPT_NUMBER,
-            .help = "zero-db port",
-        },
-        {
-            .name = ZDB_OPT_SOCKET,
-            .type = QEMU_OPT_STRING,
-            .help = "zero-db unix socket",
-        },
-        {
-            .name = BLOCK_OPT_SIZE,
-            .type = QEMU_OPT_SIZE,
-            .help = "size of the virtual disk size",
-        },
-        {
-            .name = ZDB_OPT_BLOCKSIZE,
-            .type = QEMU_OPT_SIZE,
-            .help = "internal blocksize aggregation",
-        },
-        {
-            .name = ZDB_OPT_NAMESPACE,
-            .type = QEMU_OPT_STRING,
-            .help = "zero-db namespace to use",
-        },
-        {
-            .name = ZDB_OPT_PASSWORD,
-            .type = QEMU_OPT_STRING,
-            .help = "optional zero-db namespace password",
-        },
+        // general configuration
+        {.name = ZDB_OPT_HOST,      .type = QEMU_OPT_STRING, .help = "zero-db host"},
+        {.name = ZDB_OPT_PORT,      .type = QEMU_OPT_NUMBER, .help = "zero-db port"},
+        {.name = ZDB_OPT_SOCKET,    .type = QEMU_OPT_STRING, .help = "zero-db unix socket"},
+        {.name = BLOCK_OPT_SIZE,    .type = QEMU_OPT_SIZE,   .help = "size of the virtual disk size"},
+        {.name = ZDB_OPT_BLOCKSIZE, .type = QEMU_OPT_SIZE,   .help = "internal blocksize aggregation"},
+        {.name = ZDB_OPT_NAMESPACE, .type = QEMU_OPT_STRING, .help = "zero-db namespace to use"},
+        {.name = ZDB_OPT_PASSWORD,  .type = QEMU_OPT_STRING, .help = "optional zero-db namespace password"},
+
+        // thin provisioning
+        {.name = ZDB_OPT_THIN_HOST,      .type = QEMU_OPT_STRING, .help = "thin-provisioning zero-db host"},
+        {.name = ZDB_OPT_THIN_PORT,      .type = QEMU_OPT_NUMBER, .help = "thin-provisioning zero-db port"},
+        {.name = ZDB_OPT_THIN_SOCKET,    .type = QEMU_OPT_STRING, .help = "thin-provisioning zero-db unix socket"},
+        {.name = ZDB_OPT_THIN_NAMESPACE, .type = QEMU_OPT_STRING, .help = "thin-provisioning zero-db namespace"},
+        {.name = ZDB_OPT_THIN_PASSWORD,  .type = QEMU_OPT_STRING, .help = "thin-provisioning optional zero-db namespace password"},
+
+        // active-active backup
+        {.name = ZDB_OPT_BACKUP_HOST,      .type = QEMU_OPT_STRING, .help = "active-backup zero-db host"},
+        {.name = ZDB_OPT_BACKUP_PORT,      .type = QEMU_OPT_NUMBER, .help = "active-backup zero-db port"},
+        {.name = ZDB_OPT_BACKUP_SOCKET,    .type = QEMU_OPT_STRING, .help = "active-backup zero-db unix socket"},
+        {.name = ZDB_OPT_BACKUP_NAMESPACE, .type = QEMU_OPT_STRING, .help = "active-backup zero-db namespace"},
+        {.name = ZDB_OPT_BACKUP_PASSWORD,  .type = QEMU_OPT_STRING, .help = "active-backup optional zero-db namespace password"},
 
         { /* end of list */ }
     },
@@ -259,7 +279,17 @@ static void zdb_aio_parse_filename(const char *filename, QDict *options, Error *
         ZDB_OPT_NAMESPACE,
         ZDB_OPT_PASSWORD,
         ZDB_OPT_BLOCKSIZE,
-        ZDB_OPT_SIZE
+        ZDB_OPT_SIZE,
+        ZDB_OPT_THIN_HOST,
+        ZDB_OPT_THIN_PORT,
+        ZDB_OPT_THIN_SOCKET,
+        ZDB_OPT_THIN_NAMESPACE,
+        ZDB_OPT_THIN_PASSWORD,
+        ZDB_OPT_BACKUP_HOST,
+        ZDB_OPT_BACKUP_PORT,
+        ZDB_OPT_BACKUP_SOCKET,
+        ZDB_OPT_BACKUP_NAMESPACE,
+        ZDB_OPT_BACKUP_PASSWORD,
     };
 
     while(1) {
@@ -385,8 +415,12 @@ static int zdb_reconnect(zdb_state_t *state) {
 
 static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error **errp) {
     QemuOpts *opts;
-    zdb_state_t *s = bs->opaque;
+    zdb_drv_t *drv = bs->opaque;
+    zdb_state_t *s = NULL;
     int ret = 0;
+
+    if(!(s = (zdb_state_t *) malloc(sizeof(zdb_state_t))))
+        abort();
 
     opts = qemu_opts_create(&runtime_opts, NULL, 0, &error_abort);
     qemu_opts_absorb_qdict(opts, options, &error_abort);
@@ -412,18 +446,51 @@ static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error 
 
     ret = zdb_connect(s, errp);
 
+    // setting original read server
+    drv->readlen = 1;
+    if(!(drv->readsrv = (zdb_state_t **) malloc(sizeof(zdb_state_t *) * drv->readlen)))
+        abort();
+
+    drv->readsrv[0] = s;
+
+    // setting original write server
+    drv->writelen = 1;
+    if(!(drv->writesrv = (zdb_state_t **) malloc(sizeof(zdb_state_t *) * drv->writelen)))
+        abort();
+
+    drv->writesrv[0] = s;
+
     return ret;
 }
 
 static void zdb_close(BlockDriverState *bs) {
-    zdb_state_t *s = bs->opaque;
+    zdb_drv_t *drv = bs->opaque;
 
-    zdb_debug("[+] zdb: closing\n");
-    redisFree(s->redis);
+    for(size_t i = 0; i < drv->readlen; i++) {
+        zdb_state_t *s = drv->readsrv[i];
+
+        zdb_debug("[+] zdb: closing read: %lu\n", i);
+        redisFree(s->redis);
+        s->redis = NULL;
+    }
+
+
+    for(size_t i = 0; i < drv->writelen; i++) {
+        zdb_state_t *s = drv->writesrv[i];
+
+        // skip already closed redis
+        if(!s->redis)
+            continue;
+
+        zdb_debug("[+] zdb: closing write: %lu\n", i);
+        redisFree(s->redis);
+        s->redis = NULL;
+    }
 }
 
 static int64_t zdb_getlength(BlockDriverState *bs) {
-    zdb_state_t *s = bs->opaque;
+    zdb_drv_t *drv = bs->opaque;
+    zdb_state_t *s = drv->readsrv[0];
     return s->size;
 }
 
@@ -751,7 +818,8 @@ final:
 
 static inline BlockAIOCB *zdb_aio_common(BlockDriverState *bs, BlockCompletionFunc *cb, void *opaque, zdb_request_t request) {
     zdb_aio_cb_t *acb;
-    zdb_state_t *s = bs->opaque;
+    zdb_drv_t *drv = bs->opaque;
+    zdb_state_t *s = drv->readsrv[0];
 
     acb = qemu_aio_get(&null_aiocb_info, bs, cb, opaque);
     acb->status = 0;
@@ -764,19 +832,22 @@ static inline BlockAIOCB *zdb_aio_common(BlockDriverState *bs, BlockCompletionFu
 }
 
 static BlockAIOCB *zdb_aio_readv(BlockDriverState *bs, int64_t sector, QEMUIOVector *qiov, int sectors, BlockCompletionFunc *cb, void *opaque) {
-    zdb_state_t *s = bs->opaque;
+    zdb_drv_t *drv = bs->opaque;
+    zdb_state_t *s = drv->readsrv[0];
     zdb_request_t request = zdb_request_new(s, sector, sectors, qiov, ZDB_COMMAND_READ);
     return zdb_aio_common(bs, cb, opaque, request);
 }
 
 static BlockAIOCB *zdb_aio_writev(BlockDriverState *bs, int64_t sector, QEMUIOVector *qiov, int sectors, BlockCompletionFunc *cb, void *opaque) {
-    zdb_state_t *s = bs->opaque;
+    zdb_drv_t *drv = bs->opaque;
+    zdb_state_t *s = drv->writesrv[0];
     zdb_request_t request = zdb_request_new(s, sector, sectors, qiov, ZDB_COMMAND_WRITE);
     return zdb_aio_common(bs, cb, opaque, request);
 }
 
 static BlockAIOCB *zdb_aio_flush(BlockDriverState *bs, BlockCompletionFunc *cb, void *opaque) {
-    zdb_state_t *s = bs->opaque;
+    zdb_drv_t *drv = bs->opaque;
+    zdb_state_t *s = drv->writesrv[0];
     zdb_request_t request = zdb_request_new(s, 0, 0, NULL, ZDB_COMMAND_FLUSH);
     return zdb_aio_common(bs, cb, opaque, request);
 }
@@ -818,7 +889,7 @@ static QemuOptsList zdb_create_opts = {
 static BlockDriver bdrv_zdb_aio = {
     .format_name            = "zdb",
     .protocol_name          = "zdb",
-    .instance_size          = sizeof(zdb_state_t),
+    .instance_size          = sizeof(zdb_drv_t),
 
     .bdrv_file_open         = zdb_file_open,
     .bdrv_parse_filename    = zdb_aio_parse_filename,
