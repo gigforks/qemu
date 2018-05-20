@@ -31,16 +31,20 @@ typedef struct zdb_state_t {
 
 } zdb_state_t;
 
+typedef struct zdb_backend_t {
+    size_t length;
+    zdb_state_t **targets;
+
+} zdb_backend_t;
+
 typedef struct zdb_drv_t {
     // read servers available
     // (thin-provisioning)
-    size_t readlen;
-    zdb_state_t **readsrv;
+    zdb_backend_t read;
 
     // write servers available
     // (active-backup)
-    size_t writelen;
-    zdb_state_t **writesrv;
+    zdb_backend_t write;
 
     // note: there are always at least
     // one of each, which is the general zdb
@@ -152,6 +156,7 @@ typedef struct zdb_aio_cb_t {
     BlockAIOCB common;      // common qemu blockdriver object
     zdb_request_t request;  // copy of the request
     zdb_state_t *state;     // object state
+    zdb_drv_t *drv;         // global driver object
     int status;             // return code
 
 } zdb_aio_cb_t;
@@ -325,6 +330,28 @@ static void zdb_aio_parse_filename(const char *filename, QDict *options, Error *
     }
 }
 
+static int zdb_backend_append(zdb_backend_t *backend, zdb_state_t *state) {
+    // add one slot on the list
+    backend->length += 1;
+
+    // growing up list
+    if(!(backend->targets = (zdb_state_t **) realloc(backend->targets, sizeof(zdb_state_t *) * backend->length)))
+        abort();
+
+    // append state to the list
+    backend->targets[backend->length - 1] = state;
+
+    return 0;
+}
+
+static zdb_state_t *zdb_backend_default_read(zdb_drv_t *drv) {
+    return drv->read.targets[0];
+}
+
+static zdb_state_t *zdb_backend_default_write(zdb_drv_t *drv) {
+    return drv->write.targets[0];
+}
+
 static int zdb_connect_tcp(zdb_state_t *state, Error **errp) {
     struct timeval timeout = {5, 0};
 
@@ -417,8 +444,13 @@ static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error 
     QemuOpts *opts;
     zdb_drv_t *drv = bs->opaque;
     zdb_state_t *s = NULL;
+    zdb_state_t *dflt = NULL;
     int ret = 0;
 
+    // setting up original driver to zero
+    memset(drv, 0, sizeof(zdb_drv_t));
+
+    // instanciating source zero-db
     if(!(s = (zdb_state_t *) malloc(sizeof(zdb_state_t))))
         abort();
 
@@ -435,6 +467,9 @@ static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error 
     s->size = qemu_opt_get_size(opts, BLOCK_OPT_SIZE, 1 << 30);
     s->blocksize = qemu_opt_get_size(opts, ZDB_OPT_BLOCKSIZE, ZDB_DEFAULT_BLOCKSIZE);
 
+    // set default backend
+    dflt = s;
+
     zdb_debug("[+] zdb: host: %s\n", s->socket ? s->socket : s->host);
     zdb_debug("[+] zdb: port: %d\n", s->port);
     zdb_debug("[+] zdb: size: %lu (%.2f MB)\n", s->size, s->size / (1024 * 1024.0));
@@ -443,22 +478,58 @@ static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error 
     zdb_debug("[+] zdb: password: %s\n", s->password ? "(hidden)" : "(not set)");
 
     // qemu_opts_del(opts);
-
     ret = zdb_connect(s, errp);
 
-    // setting original read server
-    drv->readlen = 1;
-    if(!(drv->readsrv = (zdb_state_t **) malloc(sizeof(zdb_state_t *) * drv->readlen)))
-        abort();
+    // push this state on backend
+    // we always have at least one read/write source
+    zdb_backend_append(&drv->read, s);
+    zdb_backend_append(&drv->write, s);
 
-    drv->readsrv[0] = s;
+    // parsing thin and backup options
+    if(qemu_opt_get(opts, ZDB_OPT_THIN_SOCKET) || qemu_opt_get(opts, ZDB_OPT_THIN_HOST)) {
+        if(!(s = (zdb_state_t *) malloc(sizeof(zdb_state_t))))
+            abort();
 
-    // setting original write server
-    drv->writelen = 1;
-    if(!(drv->writesrv = (zdb_state_t **) malloc(sizeof(zdb_state_t *) * drv->writelen)))
-        abort();
+        if(!(s->host = qemu_opt_get(opts, ZDB_OPT_THIN_HOST)))
+            s->host = "localhost";
 
-    drv->writesrv[0] = s;
+        s->socket = qemu_opt_get(opts, ZDB_OPT_THIN_SOCKET);
+        s->namespace = qemu_opt_get(opts, ZDB_OPT_THIN_NAMESPACE);
+        s->password = qemu_opt_get(opts, ZDB_OPT_THIN_PASSWORD);
+        s->port = qemu_opt_get_number(opts, ZDB_OPT_THIN_PORT, ZDB_OPT_PORT_DEFAULT);
+        s->size = dflt->size;
+        s->blocksize = dflt->blocksize;
+
+        ret = zdb_connect(s, errp);
+
+        // thin-provisioning is used as fallback read
+        zdb_backend_append(&drv->read, s);
+    }
+
+    // parsing backup
+    if(qemu_opt_get(opts, ZDB_OPT_BACKUP_SOCKET) || qemu_opt_get(opts, ZDB_OPT_BACKUP_HOST)) {
+        if(!(s = (zdb_state_t *) malloc(sizeof(zdb_state_t))))
+            abort();
+
+        if(!(s->host = qemu_opt_get(opts, ZDB_OPT_BACKUP_HOST)))
+            s->host = "localhost";
+
+        s->socket = qemu_opt_get(opts, ZDB_OPT_BACKUP_SOCKET);
+        s->namespace = qemu_opt_get(opts, ZDB_OPT_BACKUP_NAMESPACE);
+        s->password = qemu_opt_get(opts, ZDB_OPT_BACKUP_PASSWORD);
+        s->port = qemu_opt_get_number(opts, ZDB_OPT_BACKUP_PORT, ZDB_OPT_PORT_DEFAULT);
+        s->size = dflt->size;
+        s->blocksize = dflt->blocksize;
+
+        ret = zdb_connect(s, errp);
+
+        // active backup is used as duplicate write
+        zdb_backend_append(&drv->write, s);
+    }
+
+    zdb_debug("[+] zdb backend:\n");
+    zdb_debug("[+]   - read: %lu servers\n", drv->read.length);
+    zdb_debug("[+]   - write: %lu servers\n", drv->write.length);
 
     return ret;
 }
@@ -466,8 +537,8 @@ static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error 
 static void zdb_close(BlockDriverState *bs) {
     zdb_drv_t *drv = bs->opaque;
 
-    for(size_t i = 0; i < drv->readlen; i++) {
-        zdb_state_t *s = drv->readsrv[i];
+    for(size_t i = 0; i < drv->read.length; i++) {
+        zdb_state_t *s = drv->read.targets[i];
 
         zdb_debug("[+] zdb: closing read: %lu\n", i);
         redisFree(s->redis);
@@ -475,8 +546,8 @@ static void zdb_close(BlockDriverState *bs) {
     }
 
 
-    for(size_t i = 0; i < drv->writelen; i++) {
-        zdb_state_t *s = drv->writesrv[i];
+    for(size_t i = 0; i < drv->write.length; i++) {
+        zdb_state_t *s = drv->write.targets[i];
 
         // skip already closed redis
         if(!s->redis)
@@ -490,7 +561,7 @@ static void zdb_close(BlockDriverState *bs) {
 
 static int64_t zdb_getlength(BlockDriverState *bs) {
     zdb_drv_t *drv = bs->opaque;
-    zdb_state_t *s = drv->readsrv[0];
+    zdb_state_t *s = zdb_backend_default_read(drv);
     return s->size;
 }
 
@@ -556,30 +627,53 @@ static inline redisReply *zdb_read_block_issue(zdb_aio_cb_t *acb, uint64_t block
 
 static inline redisReply *zdb_read_block(zdb_aio_cb_t *acb, uint64_t blockid) {
     uint64_t key = htobe64(blockid);
-    redisReply *reply;
+    zdb_state_t *state = NULL;
+    redisReply *reply = NULL;
 
-    // does the connection is still alive
-    if(!acb->state->redis) {
-        zdb_debug("[-] zdb_read_block: connection died\n");
-        acb->status = -EIO;
-        return NULL;
+    // iterating over read backends
+    for(size_t i = 0; i < acb->drv->read.length; i++) {
+        printf("PERFORMING READ BACKEND: %lu\n", i);
+        state = acb->drv->read.targets[i];
+
+        // ensure previous reply (if any) is discarded
+        if(reply) {
+            freeReplyObject(reply);
+            reply = NULL;
+        }
+
+        // does the connection is still alive
+        if(!state->redis) {
+            zdb_debug("[-] zdb_read_block: connection died\n");
+            acb->status = -EIO;
+            continue;
+        }
+
+        // performing request
+        if(!(reply = redisCommand(state->redis, "GET %b", &key, sizeof(key)))) {
+            zdb_debug("[-] zdb: read: cannot perform request: %s\n", state->redis->errstr);
+            zdb_read_block_issue(acb, blockid);
+            continue;
+        }
+
+        // reply exists but length is not expected blocksize
+        // this block is corrupted or not what we expected
+        if(reply->len > 0 && reply->len != state->blocksize) {
+            zdb_debug("[-] zdb: read: wrong blocksize read (%u, expected %lu)\n", reply->len, state->blocksize);
+            acb->status = -EIO;
+            continue;
+        }
+
+        // key was not found, let's check the
+        // next backend, if there is no more backend
+        // this one will be returned
+        if(!reply->str)
+            continue;
+
+        acb->status = 0;
+        return reply;
     }
 
-    // performing request
-    if(!(reply = redisCommand(acb->state->redis, "GET %b", &key, sizeof(key)))) {
-        zdb_debug("[-] zdb: read: cannot perform request: %s\n", acb->state->redis->errstr);
-        return zdb_read_block_issue(acb, blockid);
-    }
-
-    // reply exists but length is not expected blocksize
-    // this block is corrupted or not what we expected
-    if(reply->len > 0 && reply->len != acb->state->blocksize) {
-        zdb_debug("[-] zdb: read: wrong blocksize read (%u, expected %lu)\n", reply->len, acb->state->blocksize);
-        acb->status = -EIO;
-        return NULL;
-    }
-
-    return reply;
+    return NULL;
 }
 
 static inline void zdb_free_block(redisReply *reply) {
@@ -819,12 +913,13 @@ final:
 static inline BlockAIOCB *zdb_aio_common(BlockDriverState *bs, BlockCompletionFunc *cb, void *opaque, zdb_request_t request) {
     zdb_aio_cb_t *acb;
     zdb_drv_t *drv = bs->opaque;
-    zdb_state_t *s = drv->readsrv[0];
+    zdb_state_t *s = zdb_backend_default_read(drv);
 
     acb = qemu_aio_get(&null_aiocb_info, bs, cb, opaque);
     acb->status = 0;
     acb->request = request;
     acb->state = s;
+    acb->drv = drv;
 
     aio_bh_schedule_oneshot(bdrv_get_aio_context(bs), zdb_bh_cb, acb);
 
@@ -833,21 +928,21 @@ static inline BlockAIOCB *zdb_aio_common(BlockDriverState *bs, BlockCompletionFu
 
 static BlockAIOCB *zdb_aio_readv(BlockDriverState *bs, int64_t sector, QEMUIOVector *qiov, int sectors, BlockCompletionFunc *cb, void *opaque) {
     zdb_drv_t *drv = bs->opaque;
-    zdb_state_t *s = drv->readsrv[0];
+    zdb_state_t *s = zdb_backend_default_read(drv);
     zdb_request_t request = zdb_request_new(s, sector, sectors, qiov, ZDB_COMMAND_READ);
     return zdb_aio_common(bs, cb, opaque, request);
 }
 
 static BlockAIOCB *zdb_aio_writev(BlockDriverState *bs, int64_t sector, QEMUIOVector *qiov, int sectors, BlockCompletionFunc *cb, void *opaque) {
     zdb_drv_t *drv = bs->opaque;
-    zdb_state_t *s = drv->writesrv[0];
+    zdb_state_t *s = zdb_backend_default_write(drv);
     zdb_request_t request = zdb_request_new(s, sector, sectors, qiov, ZDB_COMMAND_WRITE);
     return zdb_aio_common(bs, cb, opaque, request);
 }
 
 static BlockAIOCB *zdb_aio_flush(BlockDriverState *bs, BlockCompletionFunc *cb, void *opaque) {
     zdb_drv_t *drv = bs->opaque;
-    zdb_state_t *s = drv->writesrv[0];
+    zdb_state_t *s = zdb_backend_default_write(drv);
     zdb_request_t request = zdb_request_new(s, 0, 0, NULL, ZDB_COMMAND_FLUSH);
     return zdb_aio_common(bs, cb, opaque, request);
 }
