@@ -440,6 +440,15 @@ static int zdb_reconnect(zdb_state_t *state) {
     return zdb_connect(state, NULL);
 }
 
+static void zdb_dump_state(zdb_state_t *s, const char *prefix) {
+    zdb_debug("[+] zdb: %s: host: %s\n", prefix, s->socket ? s->socket : s->host);
+    zdb_debug("[+] zdb: %s: port: %d\n", prefix, s->port);
+    zdb_debug("[+] zdb: %s: size: %lu (%.2f MB)\n", prefix, s->size, s->size / (1024 * 1024.0));
+    zdb_debug("[+] zdb: %s: blocksize: %lu\n", prefix, s->blocksize);
+    zdb_debug("[+] zdb: %s: namespace: %s\n", prefix, s->namespace ? s->namespace : "(not set)");
+    zdb_debug("[+] zdb: %s: password: %s\n", prefix, s->password ? "(hidden)" : "(not set)");
+}
+
 static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error **errp) {
     QemuOpts *opts;
     zdb_drv_t *drv = bs->opaque;
@@ -470,14 +479,8 @@ static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error 
     // set default backend
     dflt = s;
 
-    zdb_debug("[+] zdb: host: %s\n", s->socket ? s->socket : s->host);
-    zdb_debug("[+] zdb: port: %d\n", s->port);
-    zdb_debug("[+] zdb: size: %lu (%.2f MB)\n", s->size, s->size / (1024 * 1024.0));
-    zdb_debug("[+] zdb: blocksize: %lu\n", s->blocksize);
-    zdb_debug("[+] zdb: namespace: %s\n", s->namespace ? s->namespace : "(not set)");
-    zdb_debug("[+] zdb: password: %s\n", s->password ? "(hidden)" : "(not set)");
-
     // qemu_opts_del(opts);
+    zdb_dump_state(s, "source");
     ret = zdb_connect(s, errp);
 
     // push this state on backend
@@ -500,6 +503,7 @@ static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error 
         s->size = dflt->size;
         s->blocksize = dflt->blocksize;
 
+        zdb_dump_state(s, "thinprov");
         ret = zdb_connect(s, errp);
 
         // thin-provisioning is used as fallback read
@@ -521,6 +525,7 @@ static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error 
         s->size = dflt->size;
         s->blocksize = dflt->blocksize;
 
+        zdb_dump_state(s, "backup");
         ret = zdb_connect(s, errp);
 
         // active backup is used as duplicate write
@@ -632,7 +637,7 @@ static inline redisReply *zdb_read_block(zdb_aio_cb_t *acb, uint64_t blockid) {
 
     // iterating over read backends
     for(size_t i = 0; i < acb->drv->read.length; i++) {
-        printf("PERFORMING READ BACKEND: %lu\n", i);
+        zdb_debug("[+] zdb_read_block: trying backend id: %lu\n", i);
         state = acb->drv->read.targets[i];
 
         // ensure previous reply (if any) is discarded
@@ -682,31 +687,41 @@ static inline void zdb_free_block(redisReply *reply) {
 
 static inline int zdb_write_block(zdb_aio_cb_t *acb, uint64_t blockid, void *payload) {
     uint64_t key = htobe64(blockid);
+    zdb_state_t *state = NULL;
     redisReply *reply;
 
-    if(!acb->state->redis) {
-        acb->status = -EIO;
-        return acb->status;
+    for(size_t i = 0; i < acb->drv->write.length; i++) {
+        zdb_debug("[+] zdb_write_block: using backend id: %lu\n", i);
+        state = acb->drv->write.targets[i];
+
+        if(!state->redis) {
+            acb->status = -EIO;
+            continue;
+        }
+
+        if(!(reply = redisCommand(state->redis, "SET %b %b", &key, sizeof(key), payload, state->blocksize))) {
+            zdb_debug("[-] zdb: write: cannot perform request: %s\n", state->redis->errstr);
+
+            // if reconnect works, retry
+            if(zdb_reconnect(state) == 0) {
+                zdb_write_block(acb, blockid, payload);
+                continue;
+            }
+
+            acb->status = -EBUSY;
+            continue;
+        }
+
+        if(reply->type != REDIS_REPLY_STRING) {
+            zdb_debug("[-] zdb: reply type: %d\n", reply->type);
+            zdb_debug("[-] zdb: write: wrong response type from server\n");
+            acb->status = -EIO;
+            continue;
+        }
+
+        acb->status = 0;
+        freeReplyObject(reply);
     }
-
-    if(!(reply = redisCommand(acb->state->redis, "SET %b %b", &key, sizeof(key), payload, acb->state->blocksize))) {
-        zdb_debug("[-] zdb: write: cannot perform request: %s\n", acb->state->redis->errstr);
-
-        // if reconnect works, retry
-        if(zdb_reconnect(acb->state) == 0)
-            return zdb_write_block(acb, blockid, payload);
-
-        acb->status = -EBUSY;
-        return acb->status;
-    }
-
-    if(reply->type != REDIS_REPLY_STRING) {
-        zdb_debug("reply %d\n", reply->type);
-        zdb_debug("[-] zdb: write: wrong response type from server\n");
-        acb->status = -EIO;
-    }
-
-    freeReplyObject(reply);
 
     return acb->status;
 }
