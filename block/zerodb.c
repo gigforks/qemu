@@ -435,9 +435,18 @@ static int zdb_connect(zdb_state_t *state, Error **errp) {
     return 0;
 }
 
+#if 0
 static int zdb_reconnect(zdb_state_t *state) {
     redisFree(state->redis);
     return zdb_connect(state, NULL);
+}
+#endif
+
+static int zdb_discard(zdb_state_t *state) {
+    redisFree(state->redis);
+    state->redis = NULL;
+
+    return 0;
 }
 
 static void zdb_dump_state(zdb_state_t *s, const char *prefix) {
@@ -488,7 +497,40 @@ static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error 
     zdb_backend_append(&drv->read, s);
     zdb_backend_append(&drv->write, s);
 
+    // parsing backup
+    if(qemu_opt_get(opts, ZDB_OPT_BACKUP_SOCKET) || qemu_opt_get(opts, ZDB_OPT_BACKUP_HOST)) {
+        if(!(s = (zdb_state_t *) malloc(sizeof(zdb_state_t))))
+            abort();
+
+        if(!(s->host = qemu_opt_get(opts, ZDB_OPT_BACKUP_HOST)))
+            s->host = "localhost";
+
+        s->socket = qemu_opt_get(opts, ZDB_OPT_BACKUP_SOCKET);
+        s->namespace = qemu_opt_get(opts, ZDB_OPT_BACKUP_NAMESPACE);
+        s->password = qemu_opt_get(opts, ZDB_OPT_BACKUP_PASSWORD);
+        s->port = qemu_opt_get_number(opts, ZDB_OPT_BACKUP_PORT, ZDB_OPT_PORT_DEFAULT);
+        s->size = dflt->size;
+        s->blocksize = dflt->blocksize;
+
+        zdb_dump_state(s, "backup");
+        ret = zdb_connect(s, errp);
+
+        // active backup is used as duplicate write
+        // we add it in read queue, since master can dies
+        // if master dies, we need to use the backup as fallback
+        zdb_backend_append(&drv->write, s);
+        zdb_backend_append(&drv->read, s);
+    }
+
     // parsing thin and backup options
+    //
+    // parsing thin-provisioning after backup
+    // like this we can chain backup and provisioning:
+    //   -> Checking on db1
+    //   -> Checking on db2
+    //   -> Checking on provisioning
+    //
+    // This is needed in case of redudancy lost
     if(qemu_opt_get(opts, ZDB_OPT_THIN_SOCKET) || qemu_opt_get(opts, ZDB_OPT_THIN_HOST)) {
         if(!(s = (zdb_state_t *) malloc(sizeof(zdb_state_t))))
             abort();
@@ -510,27 +552,6 @@ static int zdb_file_open(BlockDriverState *bs, QDict *options, int flags, Error 
         zdb_backend_append(&drv->read, s);
     }
 
-    // parsing backup
-    if(qemu_opt_get(opts, ZDB_OPT_BACKUP_SOCKET) || qemu_opt_get(opts, ZDB_OPT_BACKUP_HOST)) {
-        if(!(s = (zdb_state_t *) malloc(sizeof(zdb_state_t))))
-            abort();
-
-        if(!(s->host = qemu_opt_get(opts, ZDB_OPT_BACKUP_HOST)))
-            s->host = "localhost";
-
-        s->socket = qemu_opt_get(opts, ZDB_OPT_BACKUP_SOCKET);
-        s->namespace = qemu_opt_get(opts, ZDB_OPT_BACKUP_NAMESPACE);
-        s->password = qemu_opt_get(opts, ZDB_OPT_BACKUP_PASSWORD);
-        s->port = qemu_opt_get_number(opts, ZDB_OPT_BACKUP_PORT, ZDB_OPT_PORT_DEFAULT);
-        s->size = dflt->size;
-        s->blocksize = dflt->blocksize;
-
-        zdb_dump_state(s, "backup");
-        ret = zdb_connect(s, errp);
-
-        // active backup is used as duplicate write
-        zdb_backend_append(&drv->write, s);
-    }
 
     zdb_debug("[+] zdb backend:\n");
     zdb_debug("[+]   - read: %lu servers\n", drv->read.length);
@@ -622,9 +643,12 @@ static inline redisReply *zdb_read_block(zdb_aio_cb_t *acb, uint64_t blockid);
 static inline int zdb_write_block(zdb_aio_cb_t *acb, uint64_t blockid, void *payload);
 
 static inline redisReply *zdb_read_block_issue(zdb_aio_cb_t *acb, uint64_t blockid) {
+    // skipping reconnection for now
+    #if 0
     // if reconnect works, retry
     if(zdb_reconnect(acb->state) == 0)
         return zdb_read_block(acb, blockid);
+    #endif
 
     acb->status = -EBUSY;
     return NULL;
@@ -695,6 +719,11 @@ static inline int zdb_write_block(zdb_aio_cb_t *acb, uint64_t blockid, void *pay
         state = acb->drv->write.targets[i];
 
         if(!state->redis) {
+            zdb_debug("[-] zdb_write_block: closed backend: %lu\n", i);
+
+            if(i > 0 && acb->status == 0)
+                continue;
+
             acb->status = -EIO;
             continue;
         }
@@ -702,11 +731,25 @@ static inline int zdb_write_block(zdb_aio_cb_t *acb, uint64_t blockid, void *pay
         if(!(reply = redisCommand(state->redis, "SET %b %b", &key, sizeof(key), payload, state->blocksize))) {
             zdb_debug("[-] zdb: write: cannot perform request: %s\n", state->redis->errstr);
 
+            // disable auto-reconnection for now
+            #if 0
             // if reconnect works, retry
             if(zdb_reconnect(state) == 0) {
                 zdb_write_block(acb, blockid, payload);
                 continue;
             }
+            #endif
+
+            // set state as disconnected
+            zdb_debug("[+] === WARNING\n");
+            zdb_debug("[-] BACKEND DEAD. ENTERING DEGRADED MODE.\n");
+            zdb_debug("[+] === WARNING\n");
+            zdb_discard(state);
+
+            // degraded mode but previous write succeed,
+            // we are still alive
+            if(i > 0 && acb->status == 0)
+                continue;
 
             acb->status = -EBUSY;
             continue;
@@ -715,6 +758,10 @@ static inline int zdb_write_block(zdb_aio_cb_t *acb, uint64_t blockid, void *pay
         if(reply->type != REDIS_REPLY_STRING) {
             zdb_debug("[-] zdb: reply type: %d\n", reply->type);
             zdb_debug("[-] zdb: write: wrong response type from server\n");
+
+            if(i > 0 && acb->status == 0)
+                continue;
+
             acb->status = -EIO;
             continue;
         }
