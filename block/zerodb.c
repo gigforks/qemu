@@ -695,14 +695,18 @@ static inline redisReply *zdb_read_block(zdb_aio_cb_t *acb, uint64_t blockid) {
         // key was not found, let's check the
         // next backend, if there is no more backend
         // this one will be returned
-        if(!reply->str)
+        if(!reply->str) {
+            zdb_debug("[-] zdb: read: not found, looking next backend\n");
             continue;
+        }
 
         acb->status = 0;
         return reply;
     }
 
-    return NULL;
+    zdb_debug("[+] zdb: read: block read (acb status: %d)\n", acb->status);
+
+    return reply;
 }
 
 static inline void zdb_free_block(redisReply *reply) {
