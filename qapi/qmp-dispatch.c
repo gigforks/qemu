@@ -17,8 +17,9 @@
 #include "qapi/qmp/json-parser.h"
 #include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qjson.h"
+#include "qapi/qmp/qbool.h"
 
-static QDict *qmp_dispatch_check_obj(const QObject *request, Error **errp)
+QDict *qmp_dispatch_check_obj(const QObject *request, Error **errp)
 {
     const QDictEntry *ent;
     const char *arg_name;
@@ -26,7 +27,7 @@ static QDict *qmp_dispatch_check_obj(const QObject *request, Error **errp)
     bool has_exec_key = false;
     QDict *dict = NULL;
 
-    dict = qobject_to_qdict(request);
+    dict = qobject_to(QDict, request);
     if (!dict) {
         error_setg(errp, "QMP input must be a JSON object");
         return NULL;
@@ -48,6 +49,14 @@ static QDict *qmp_dispatch_check_obj(const QObject *request, Error **errp)
             if (qobject_type(arg_obj) != QTYPE_QDICT) {
                 error_setg(errp,
                            "QMP input member 'arguments' must be an object");
+                return NULL;
+            }
+        } else if (!strcmp(arg_name, "id")) {
+            continue;
+        } else if (!strcmp(arg_name, "control")) {
+            if (qobject_type(arg_obj) != QTYPE_QDICT) {
+                error_setg(errp,
+                           "QMP input member 'control' must be a dict");
                 return NULL;
             }
         } else {
@@ -113,11 +122,37 @@ static QObject *do_qmp_dispatch(QmpCommandList *cmds, QObject *request,
     return ret;
 }
 
-QObject *qmp_build_error_object(Error *err)
+QDict *qmp_error_response(Error *err)
 {
-    return qobject_from_jsonf("{ 'class': %s, 'desc': %s }",
-                              QapiErrorClass_str(error_get_class(err)),
-                              error_get_pretty(err));
+    QDict *rsp;
+
+    rsp = qdict_from_jsonf_nofail("{ 'error': { 'class': %s, 'desc': %s } }",
+                                  QapiErrorClass_str(error_get_class(err)),
+                                  error_get_pretty(err));
+    error_free(err);
+    return rsp;
+}
+
+/*
+ * Detect whether a request should be run out-of-band, by quickly
+ * peeking at whether we have: { "control": { "run-oob": true } }. By
+ * default commands are run in-band.
+ */
+bool qmp_is_oob(QDict *dict)
+{
+    QBool *bool_obj;
+
+    dict = qdict_get_qdict(dict, "control");
+    if (!dict) {
+        return false;
+    }
+
+    bool_obj = qobject_to(QBool, qdict_get(dict, "run-oob"));
+    if (!bool_obj) {
+        return false;
+    }
+
+    return qbool_get_bool(bool_obj);
 }
 
 QObject *qmp_dispatch(QmpCommandList *cmds, QObject *request)
@@ -128,15 +163,13 @@ QObject *qmp_dispatch(QmpCommandList *cmds, QObject *request)
 
     ret = do_qmp_dispatch(cmds, request, &err);
 
-    rsp = qdict_new();
     if (err) {
-        qdict_put_obj(rsp, "error", qmp_build_error_object(err));
-        error_free(err);
+        rsp = qmp_error_response(err);
     } else if (ret) {
+        rsp = qdict_new();
         qdict_put_obj(rsp, "return", ret);
     } else {
-        QDECREF(rsp);
-        return NULL;
+        rsp = NULL;
     }
 
     return QOBJECT(rsp);

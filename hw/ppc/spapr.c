@@ -722,8 +722,7 @@ static int spapr_populate_drconf_memory(sPAPRMachineState *spapr, void *fdt)
     }
 
     if (hotplug_lmb_start) {
-        MemoryDeviceInfoList **prev = &dimms;
-        qmp_pc_dimm_device_list(qdev_get_machine(), &prev);
+        dimms = qmp_pc_dimm_device_list();
     }
 
     /* ibm,dynamic-memory */
@@ -866,6 +865,7 @@ int spapr_h_cas_compose_response(sPAPRMachineState *spapr,
     /* Create skeleton */
     fdt_skel = g_malloc0(size);
     _FDT((fdt_create(fdt_skel, size)));
+    _FDT((fdt_finish_reservemap(fdt_skel)));
     _FDT((fdt_begin_node(fdt_skel, "")));
     _FDT((fdt_end_node(fdt_skel)));
     _FDT((fdt_finish(fdt_skel)));
@@ -2392,6 +2392,7 @@ static void spapr_machine_init(MachineState *machine)
     long load_limit, fw_size;
     char *filename;
     Error *resize_hpt_err = NULL;
+    PowerPCCPU *first_ppc_cpu;
 
     msi_nonbroken = true;
 
@@ -2484,11 +2485,6 @@ static void spapr_machine_init(MachineState *machine)
     }
 
     spapr_ovec_set(spapr->ov5, OV5_FORM1_AFFINITY);
-    if (!kvm_enabled() || kvmppc_has_cap_mmu_radix()) {
-        /* KVM and TCG always allow GTSE with radix... */
-        spapr_ovec_set(spapr->ov5, OV5_MMU_RADIX_GTSE);
-    }
-    /* ... but not with hash (currently). */
 
     /* advertise support for dedicated HP event source to guests */
     if (spapr->use_hotplug_event_source) {
@@ -2502,6 +2498,15 @@ static void spapr_machine_init(MachineState *machine)
 
     /* init CPUs */
     spapr_init_cpus(spapr);
+
+    first_ppc_cpu = POWERPC_CPU(first_cpu);
+    if ((!kvm_enabled() || kvmppc_has_cap_mmu_radix()) &&
+        ppc_check_compat(first_ppc_cpu, CPU_POWERPC_LOGICAL_3_00, 0,
+                         spapr->max_compat_pvr)) {
+        /* KVM and TCG always allow GTSE with radix... */
+        spapr_ovec_set(spapr->ov5, OV5_MMU_RADIX_GTSE);
+    }
+    /* ... but not with hash (currently). */
 
     if (kvm_enabled()) {
         /* Enable H_LOGICAL_CI_* so SLOF can talk to in-kernel devices */
@@ -2607,10 +2612,11 @@ static void spapr_machine_init(MachineState *machine)
         NICInfo *nd = &nd_table[i];
 
         if (!nd->model) {
-            nd->model = g_strdup("ibmveth");
+            nd->model = g_strdup("spapr-vlan");
         }
 
-        if (strcmp(nd->model, "ibmveth") == 0) {
+        if (g_str_equal(nd->model, "spapr-vlan") ||
+            g_str_equal(nd->model, "ibmveth")) {
             spapr_vlan_create(spapr->vio_bus, nd);
         } else {
             pci_nic_init_nofail(&nd_table[i], phb->bus, nd->model, NULL);

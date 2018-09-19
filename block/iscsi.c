@@ -732,7 +732,7 @@ retry:
         goto out_unlock;
     }
 
-    *pnum = lbasd->num_blocks * iscsilun->block_size;
+    *pnum = (int64_t) lbasd->num_blocks * iscsilun->block_size;
 
     if (lbasd->provisioning == SCSI_PROVISIONING_TYPE_DEALLOCATED ||
         lbasd->provisioning == SCSI_PROVISIONING_TYPE_ANCHORED) {
@@ -2244,7 +2244,7 @@ static BlockDriver bdrv_iser = {
     .create_opts            = &iscsi_create_opts,
     .bdrv_reopen_prepare    = iscsi_reopen_prepare,
     .bdrv_reopen_commit     = iscsi_reopen_commit,
-    .bdrv_invalidate_cache  = iscsi_invalidate_cache,
+    .bdrv_co_invalidate_cache  = iscsi_co_invalidate_cache,
 
     .bdrv_getlength  = iscsi_getlength,
     .bdrv_get_info   = iscsi_get_info,

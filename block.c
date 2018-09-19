@@ -33,6 +33,7 @@
 #include "qapi/error.h"
 #include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qjson.h"
+#include "qapi/qmp/qnull.h"
 #include "qapi/qmp/qstring.h"
 #include "qapi/qobject-output-visitor.h"
 #include "qapi/qapi-visit-block-core.h"
@@ -1457,7 +1458,7 @@ static QDict *parse_json_filename(const char *filename, Error **errp)
         return NULL;
     }
 
-    options = qobject_to_qdict(options_obj);
+    options = qobject_to(QDict, options_obj);
     if (!options) {
         qobject_decref(options_obj);
         error_setg(errp, "Invalid JSON object given");
@@ -1619,11 +1620,22 @@ static int bdrv_reopen_get_flags(BlockReopenQueue *q, BlockDriverState *bs)
 
 /* Returns whether the image file can be written to after the reopen queue @q
  * has been successfully applied, or right now if @q is NULL. */
-static bool bdrv_is_writable(BlockDriverState *bs, BlockReopenQueue *q)
+static bool bdrv_is_writable_after_reopen(BlockDriverState *bs,
+                                          BlockReopenQueue *q)
 {
     int flags = bdrv_reopen_get_flags(q, bs);
 
     return (flags & (BDRV_O_RDWR | BDRV_O_INACTIVE)) == BDRV_O_RDWR;
+}
+
+/*
+ * Return whether the BDS can be written to.  This is not necessarily
+ * the same as !bdrv_is_read_only(bs), as inactivated images may not
+ * be written to but do not count as read-only images.
+ */
+bool bdrv_is_writable(BlockDriverState *bs)
+{
+    return bdrv_is_writable_after_reopen(bs, NULL);
 }
 
 static void bdrv_child_perm(BlockDriverState *bs, BlockDriverState *child_bs,
@@ -1663,7 +1675,7 @@ static int bdrv_check_perm(BlockDriverState *bs, BlockReopenQueue *q,
 
     /* Write permissions never work with read-only images */
     if ((cumulative_perms & (BLK_PERM_WRITE | BLK_PERM_WRITE_UNCHANGED)) &&
-        !bdrv_is_writable(bs, q))
+        !bdrv_is_writable_after_reopen(bs, q))
     {
         error_setg(errp, "Block node is read-only");
         return -EPERM;
@@ -1955,7 +1967,7 @@ void bdrv_format_default_perms(BlockDriverState *bs, BdrvChild *c,
                                   &perm, &shared);
 
         /* Format drivers may touch metadata even if the guest doesn't write */
-        if (bdrv_is_writable(bs, reopen_queue)) {
+        if (bdrv_is_writable_after_reopen(bs, reopen_queue)) {
             perm |= BLK_PERM_WRITE | BLK_PERM_RESIZE;
         }
 
@@ -2433,7 +2445,7 @@ BlockDriverState *bdrv_open_blockdev_ref(BlockdevRef *ref, Error **errp)
         }
         visit_complete(v, &obj);
 
-        qdict = qobject_to_qdict(obj);
+        qdict = qobject_to(QDict, obj);
         qdict_flatten(qdict);
 
         /* bdrv_open_inherit() defaults to the values in bdrv_flags (for
@@ -2645,7 +2657,13 @@ static BlockDriverState *bdrv_open_inherit(const char *filename,
 
     /* See cautionary note on accessing @options above */
     backing = qdict_get_try_str(options, "backing");
-    if (backing && *backing == '\0') {
+    if (qobject_to(QNull, qdict_get(options, "backing")) != NULL ||
+        (backing && *backing == '\0'))
+    {
+        if (backing) {
+            warn_report("Use of \"backing\": \"\" is deprecated; "
+                        "use \"backing\": null instead");
+        }
         flags |= BDRV_O_NO_BACKING;
         qdict_del(options, "backing");
     }
@@ -2883,8 +2901,16 @@ static BlockReopenQueue *bdrv_reopen_queue_child(BlockReopenQueue *bs_queue,
 
     /* Inherit from parent node */
     if (parent_options) {
+        QemuOpts *opts;
+        QDict *options_copy;
         assert(!flags);
         role->inherit_options(&flags, options, parent_flags, parent_options);
+        options_copy = qdict_clone_shallow(options);
+        opts = qemu_opts_create(&bdrv_runtime_opts, NULL, 0, &error_abort);
+        qemu_opts_absorb_qdict(opts, options_copy, NULL);
+        update_flags_from_options(&flags, opts);
+        qemu_opts_del(opts);
+        QDECREF(options_copy);
     }
 
     /* Old values are used for options that aren't set yet */
@@ -3671,12 +3697,12 @@ int bdrv_drop_intermediate(BlockDriverState *top, BlockDriverState *base,
         GSList *ignore_children = g_slist_prepend(NULL, c);
         bdrv_check_update_perm(base, NULL, c->perm, c->shared_perm,
                                ignore_children, &local_err);
+        g_slist_free(ignore_children);
         if (local_err) {
             ret = -EPERM;
             error_report_err(local_err);
             goto exit;
         }
-        g_slist_free(ignore_children);
 
         /* If so, update the backing file path in the image file */
         if (c->role->update_filename) {

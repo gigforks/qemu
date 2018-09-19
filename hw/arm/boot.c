@@ -422,6 +422,7 @@ static void fdt_add_psci_node(void *fdt)
     ARMCPU *armcpu = ARM_CPU(qemu_get_cpu(0));
     const char *psci_method;
     int64_t psci_conduit;
+    int rc;
 
     psci_conduit = object_property_get_int(OBJECT(armcpu),
                                            "psci-conduit",
@@ -437,6 +438,15 @@ static void fdt_add_psci_node(void *fdt)
         break;
     default:
         g_assert_not_reached();
+    }
+
+    /*
+     * If /psci node is present in provided DTB, assume that no fixup
+     * is necessary and all PSCI configuration should be taken as-is
+     */
+    rc = fdt_path_offset(fdt, "/psci");
+    if (rc >= 0) {
+        return;
     }
 
     qemu_fdt_add_subnode(fdt, "/psci");
@@ -720,6 +730,18 @@ static void do_cpu_reset(void *opaque)
                     } else {
                         env->pstate = PSTATE_MODE_EL1h;
                     }
+                    /* AArch64 kernels never boot in secure mode */
+                    assert(!info->secure_boot);
+                    /* This hook is only supported for AArch32 currently:
+                     * bootloader_aarch64[] will not call the hook, and
+                     * the code above has already dropped us into EL2 or EL1.
+                     */
+                    assert(!info->secure_board_setup);
+                }
+
+                if (arm_feature(env, ARM_FEATURE_EL2)) {
+                    /* If we have EL2 then Linux expects the HVC insn to work */
+                    env->cp15.scr_el3 |= SCR_HCE;
                 }
 
                 /* Set to non-secure if not a secure boot */

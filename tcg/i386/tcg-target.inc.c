@@ -854,11 +854,11 @@ static void tcg_out_dup_vec(TCGContext *s, TCGType type, unsigned vece,
         switch (vece) {
         case MO_8:
             /* ??? With zero in a register, use PSHUFB.  */
-            tcg_out_vex_modrm(s, OPC_PUNPCKLBW, r, 0, a);
+            tcg_out_vex_modrm(s, OPC_PUNPCKLBW, r, a, a);
             a = r;
             /* FALLTHRU */
         case MO_16:
-            tcg_out_vex_modrm(s, OPC_PUNPCKLWD, r, 0, a);
+            tcg_out_vex_modrm(s, OPC_PUNPCKLWD, r, a, a);
             a = r;
             /* FALLTHRU */
         case MO_32:
@@ -867,7 +867,7 @@ static void tcg_out_dup_vec(TCGContext *s, TCGType type, unsigned vece,
             tcg_out8(s, 0);
             break;
         case MO_64:
-            tcg_out_vex_modrm(s, OPC_PUNPCKLQDQ, r, 0, a);
+            tcg_out_vex_modrm(s, OPC_PUNPCKLQDQ, r, a, a);
             break;
         default:
             g_assert_not_reached();
@@ -2245,7 +2245,7 @@ static inline void tcg_out_op(TCGContext *s, TCGOpcode opc,
             tcg_out_modrm_offset(s, OPC_GRP5, EXT5_JMPN_Ev, -1,
                                  (intptr_t)(s->tb_jmp_target_addr + a0));
         }
-        s->tb_jmp_reset_offset[a0] = tcg_current_code_size(s);
+        set_jmp_reset_offset(s, a0);
         break;
     case INDEX_op_goto_ptr:
         /* jmp to the given host address (could be epilogue) */
@@ -2696,6 +2696,12 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_x86_packus_vec:
         insn = packus_insn[vece];
         goto gen_simd;
+#if TCG_TARGET_REG_BITS == 32
+    case INDEX_op_dup2_vec:
+        /* Constraints have already placed both 32-bit inputs in xmm regs.  */
+        insn = OPC_PUNPCKLDQ;
+        goto gen_simd;
+#endif
     gen_simd:
         tcg_debug_assert(insn != OPC_UD2);
         if (type == TCG_TYPE_V256) {
@@ -3045,6 +3051,9 @@ static const TCGTargetOpDef *tcg_target_op_def(TCGOpcode op)
     case INDEX_op_x86_vperm2i128_vec:
     case INDEX_op_x86_punpckl_vec:
     case INDEX_op_x86_punpckh_vec:
+#if TCG_TARGET_REG_BITS == 32
+    case INDEX_op_dup2_vec:
+#endif
         return &x_x_x;
     case INDEX_op_dup_vec:
     case INDEX_op_shli_vec:
@@ -3520,7 +3529,7 @@ static void tcg_target_init(TCGContext *s)
         tcg_target_available_regs[TCG_TYPE_V256] = ALL_VECTOR_REGS;
     }
 
-    tcg_target_call_clobber_regs = 0;
+    tcg_target_call_clobber_regs = ALL_VECTOR_REGS;
     tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_EAX);
     tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_EDX);
     tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_ECX);

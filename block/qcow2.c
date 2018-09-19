@@ -1142,6 +1142,7 @@ static int coroutine_fn qcow2_do_open(BlockDriverState *bs, QDict *options,
     uint64_t ext_end;
     uint64_t l1_vm_state_index;
     bool update_header = false;
+    bool header_updated = false;
 
     ret = bdrv_pread(bs->file, 0, &header, sizeof(header));
     if (ret < 0) {
@@ -1480,9 +1481,23 @@ static int coroutine_fn qcow2_do_open(BlockDriverState *bs, QDict *options,
         s->autoclear_features &= QCOW2_AUTOCLEAR_MASK;
     }
 
-    if (qcow2_load_dirty_bitmaps(bs, &local_err)) {
-        update_header = false;
+    if (s->dirty_bitmaps_loaded) {
+        /* It's some kind of reopen. There are no known cases where we need to
+         * reload bitmaps in such a situation, so it's safer to skip them.
+         *
+         * Moreover, if we have some readonly bitmaps and we are reopening for
+         * rw we should reopen bitmaps correspondingly.
+         */
+        if (bdrv_has_readonly_bitmaps(bs) &&
+            !bdrv_is_read_only(bs) && !(bdrv_get_flags(bs) & BDRV_O_INACTIVE))
+        {
+            qcow2_reopen_bitmaps_rw_hint(bs, &header_updated, &local_err);
+        }
+    } else {
+        header_updated = qcow2_load_dirty_bitmaps(bs, &local_err);
+        s->dirty_bitmaps_loaded = true;
     }
+    update_header = update_header && !header_updated;
     if (local_err != NULL) {
         error_propagate(errp, local_err);
         ret = -EINVAL;
@@ -3125,7 +3140,7 @@ static int coroutine_fn qcow2_co_create_opts(const char *filename, QemuOpts *opt
     /* Now get the QAPI type BlockdevCreateOptions */
     qobj = qdict_crumple(qdict, errp);
     QDECREF(qdict);
-    qdict = qobject_to_qdict(qobj);
+    qdict = qobject_to(QDict, qobj);
     if (qdict == NULL) {
         ret = -EINVAL;
         goto finish;
@@ -4371,7 +4386,7 @@ void qcow2_signal_corruption(BlockDriverState *bs, bool fatal, int64_t offset,
     char *message;
     va_list ap;
 
-    fatal = fatal && !bs->read_only;
+    fatal = fatal && bdrv_is_writable(bs);
 
     if (s->signaled_corruption &&
         (!fatal || (s->incompatible_features & QCOW2_INCOMPAT_CORRUPT)))

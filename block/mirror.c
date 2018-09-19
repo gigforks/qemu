@@ -868,15 +868,16 @@ static void coroutine_fn mirror_run(void *opaque)
         }
 
         ret = 0;
-        trace_mirror_before_sleep(s, cnt, s->synced, delay_ns);
-        if (!s->synced) {
-            block_job_sleep_ns(&s->common, delay_ns);
-            if (block_job_is_cancelled(&s->common)) {
-                break;
-            }
-        } else if (!should_complete) {
+
+        if (s->synced && !should_complete) {
             delay_ns = (s->in_flight == 0 && cnt == 0 ? SLICE_TIME : 0);
-            block_job_sleep_ns(&s->common, delay_ns);
+        }
+        trace_mirror_before_sleep(s, cnt, s->synced, delay_ns);
+        block_job_sleep_ns(&s->common, delay_ns);
+        if (block_job_is_cancelled(&s->common) &&
+            (!s->synced || s->common.force))
+        {
+            break;
         }
         s->last_pause_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     }
@@ -887,7 +888,8 @@ immediate_exit:
          * or it was cancelled prematurely so that we do not guarantee that
          * the target is a copy of the source.
          */
-        assert(ret < 0 || (!s->synced && block_job_is_cancelled(&s->common)));
+        assert(ret < 0 || ((s->common.force || !s->synced) &&
+               block_job_is_cancelled(&s->common)));
         assert(need_drain);
         mirror_wait_for_all_io(s);
     }
@@ -1166,7 +1168,7 @@ static void mirror_start_job(const char *job_id, BlockDriverState *bs,
     }
 
     /* Make sure that the source is not resized while the job is running */
-    s = block_job_create(job_id, driver, mirror_top_bs,
+    s = block_job_create(job_id, driver, NULL, mirror_top_bs,
                          BLK_PERM_CONSISTENT_READ,
                          BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE_UNCHANGED |
                          BLK_PERM_WRITE | BLK_PERM_GRAPH_MOD, speed,

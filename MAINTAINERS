@@ -289,7 +289,7 @@ T: git git://github.com/ehabkost/qemu.git x86-next
 
 Xtensa
 M: Max Filippov <jcmvbkbc@gmail.com>
-W: http://wiki.osll.spb.ru/doku.php?id=etc:users:jcmvbkbc:qemu-target-xtensa
+W: http://wiki.osll.ru/doku.php?id=etc:users:jcmvbkbc:qemu-target-xtensa
 S: Maintained
 F: target/xtensa/
 F: hw/xtensa/
@@ -1351,6 +1351,7 @@ F: util/aio-*.c
 F: block/io.c
 F: migration/block*
 F: include/block/aio.h
+F: include/block/aio-wait.h
 F: scripts/qemugdb/aio.py
 T: git git://github.com/stefanha/qemu.git block
 
@@ -1779,6 +1780,12 @@ F: net/filter-replay.c
 F: include/sysemu/replay.h
 F: docs/replay.txt
 F: stubs/replay.c
+
+IOVA Tree
+M: Peter Xu <peterx@redhat.com>
+S: Maintained
+F: include/qemu/iova-tree.h
+F: util/iova-tree.c
 
 Usermode Emulation
 ------------------

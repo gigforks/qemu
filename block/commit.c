@@ -202,6 +202,8 @@ static void coroutine_fn commit_run(void *opaque)
 
         if (copy && s->common.speed) {
             delay_ns = ratelimit_calculate_delay(&s->limit, n);
+        } else {
+            delay_ns = 0;
         }
     }
 
@@ -289,7 +291,7 @@ void commit_start(const char *job_id, BlockDriverState *bs,
         return;
     }
 
-    s = block_job_create(job_id, &commit_job_driver, bs, 0, BLK_PERM_ALL,
+    s = block_job_create(job_id, &commit_job_driver, NULL, bs, 0, BLK_PERM_ALL,
                          speed, BLOCK_JOB_DEFAULT, NULL, NULL, errp);
     if (!s) {
         return;

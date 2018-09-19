@@ -7910,7 +7910,6 @@ static void arm_cpu_do_interrupt_aarch32(CPUState *cs)
         offset = 0;
         break;
     case EXCP_BKPT:
-        env->exception.fsr = 2;
         /* Fall through to prefetch abort.  */
     case EXCP_PREFETCH_ABORT:
         A32_BANKED_CURRENT_REG_SET(env, ifsr, env->exception.fsr);
@@ -9626,9 +9625,9 @@ static bool get_phys_addr_pmsav7(CPUARMState *env, uint32_t address,
             }
             if (rsize < TARGET_PAGE_BITS) {
                 qemu_log_mask(LOG_UNIMP,
-                              "DRSR[%d]: No support for MPU (sub)region "
-                              "alignment of %" PRIu32 " bits. Minimum is %d\n",
-                              n, rsize, TARGET_PAGE_BITS);
+                              "DRSR[%d]: No support for MPU (sub)region size of"
+                              " %" PRIu32 " bytes. Minimum is %d.\n",
+                              n, (1 << rsize), TARGET_PAGE_SIZE);
                 continue;
             }
             if (srdis) {
@@ -11410,11 +11409,94 @@ VFP_CONV_FIX_A64(sq, s, 32, 64, int64)
 VFP_CONV_FIX(uh, s, 32, 32, uint16)
 VFP_CONV_FIX(ul, s, 32, 32, uint32)
 VFP_CONV_FIX_A64(uq, s, 32, 64, uint64)
-VFP_CONV_FIX_A64(sl, h, 16, 32, int32)
-VFP_CONV_FIX_A64(ul, h, 16, 32, uint32)
+
 #undef VFP_CONV_FIX
 #undef VFP_CONV_FIX_FLOAT
 #undef VFP_CONV_FLOAT_FIX_ROUND
+#undef VFP_CONV_FIX_A64
+
+/* Conversion to/from f16 can overflow to infinity before/after scaling.
+ * Therefore we convert to f64, scale, and then convert f64 to f16; or
+ * vice versa for conversion to integer.
+ *
+ * For 16- and 32-bit integers, the conversion to f64 never rounds.
+ * For 64-bit integers, any integer that would cause rounding will also
+ * overflow to f16 infinity, so there is no double rounding problem.
+ */
+
+static float16 do_postscale_fp16(float64 f, int shift, float_status *fpst)
+{
+    return float64_to_float16(float64_scalbn(f, -shift, fpst), true, fpst);
+}
+
+float16 HELPER(vfp_sltoh)(uint32_t x, uint32_t shift, void *fpst)
+{
+    return do_postscale_fp16(int32_to_float64(x, fpst), shift, fpst);
+}
+
+float16 HELPER(vfp_ultoh)(uint32_t x, uint32_t shift, void *fpst)
+{
+    return do_postscale_fp16(uint32_to_float64(x, fpst), shift, fpst);
+}
+
+float16 HELPER(vfp_sqtoh)(uint64_t x, uint32_t shift, void *fpst)
+{
+    return do_postscale_fp16(int64_to_float64(x, fpst), shift, fpst);
+}
+
+float16 HELPER(vfp_uqtoh)(uint64_t x, uint32_t shift, void *fpst)
+{
+    return do_postscale_fp16(uint64_to_float64(x, fpst), shift, fpst);
+}
+
+static float64 do_prescale_fp16(float16 f, int shift, float_status *fpst)
+{
+    if (unlikely(float16_is_any_nan(f))) {
+        float_raise(float_flag_invalid, fpst);
+        return 0;
+    } else {
+        int old_exc_flags = get_float_exception_flags(fpst);
+        float64 ret;
+
+        ret = float16_to_float64(f, true, fpst);
+        ret = float64_scalbn(ret, shift, fpst);
+        old_exc_flags |= get_float_exception_flags(fpst)
+            & float_flag_input_denormal;
+        set_float_exception_flags(old_exc_flags, fpst);
+
+        return ret;
+    }
+}
+
+uint32_t HELPER(vfp_toshh)(float16 x, uint32_t shift, void *fpst)
+{
+    return float64_to_int16(do_prescale_fp16(x, shift, fpst), fpst);
+}
+
+uint32_t HELPER(vfp_touhh)(float16 x, uint32_t shift, void *fpst)
+{
+    return float64_to_uint16(do_prescale_fp16(x, shift, fpst), fpst);
+}
+
+uint32_t HELPER(vfp_toslh)(float16 x, uint32_t shift, void *fpst)
+{
+    return float64_to_int32(do_prescale_fp16(x, shift, fpst), fpst);
+}
+
+uint32_t HELPER(vfp_toulh)(float16 x, uint32_t shift, void *fpst)
+{
+    return float64_to_uint32(do_prescale_fp16(x, shift, fpst), fpst);
+}
+
+uint64_t HELPER(vfp_tosqh)(float16 x, uint32_t shift, void *fpst)
+{
+    return float64_to_int64(do_prescale_fp16(x, shift, fpst), fpst);
+}
+
+uint64_t HELPER(vfp_touqh)(float16 x, uint32_t shift, void *fpst)
+{
+    return float64_to_uint64(do_prescale_fp16(x, shift, fpst), fpst);
+}
 
 /* Set the current fp rounding mode and return the old one.
  * The argument is a softfloat float_round_ value.

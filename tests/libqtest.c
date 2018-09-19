@@ -166,7 +166,8 @@ static const char *qtest_qemu_binary(void)
     return qemu_bin;
 }
 
-QTestState *qtest_init_without_qmp_handshake(const char *extra_args)
+QTestState *qtest_init_without_qmp_handshake(bool use_oob,
+                                             const char *extra_args)
 {
     QTestState *s;
     int sock, qmpsock, i;
@@ -199,12 +200,13 @@ QTestState *qtest_init_without_qmp_handshake(const char *extra_args)
         command = g_strdup_printf("exec %s "
                                   "-qtest unix:%s,nowait "
                                   "-qtest-log %s "
-                                  "-qmp unix:%s,nowait "
+                                  "-chardev socket,path=%s,nowait,id=char0 "
+                                  "-mon chardev=char0,mode=control%s "
                                   "-machine accel=qtest "
                                   "-display none "
                                   "%s", qemu_binary, socket_path,
                                   getenv("QTEST_LOG") ? "/dev/fd/2" : "/dev/null",
-                                  qmp_socket_path,
+                                  qmp_socket_path, use_oob ? ",x-oob=on" : "",
                                   extra_args ?: "");
         execlp("/bin/sh", "sh", "-c", command, NULL);
         exit(1);
@@ -239,7 +241,7 @@ QTestState *qtest_init_without_qmp_handshake(const char *extra_args)
 
 QTestState *qtest_init(const char *extra_args)
 {
-    QTestState *s = qtest_init_without_qmp_handshake(extra_args);
+    QTestState *s = qtest_init_without_qmp_handshake(false, extra_args);
 
     /* Read the QMP greeting and then do the handshake */
     qtest_qmp_discard_response(s, "");
@@ -430,7 +432,7 @@ static void qmp_response(JSONMessageParser *parser, GQueue *tokens)
     }
 
     g_assert(!qmp->response);
-    qmp->response = qobject_to_qdict(obj);
+    qmp->response = qobject_to(QDict, obj);
     g_assert(qmp->response);
 }
 
@@ -1008,11 +1010,11 @@ void qtest_cb_for_every_machine(void (*cb)(const char *machine))
     g_assert(list);
 
     for (p = qlist_first(list); p; p = qlist_next(p)) {
-        minfo = qobject_to_qdict(qlist_entry_obj(p));
+        minfo = qobject_to(QDict, qlist_entry_obj(p));
         g_assert(minfo);
         qobj = qdict_get(minfo, "name");
         g_assert(qobj);
-        qstr = qobject_to_qstring(qobj);
+        qstr = qobject_to(QString, qobj);
         g_assert(qstr);
         mname = qstring_get_str(qstr);
         cb(mname);

@@ -195,6 +195,8 @@
  * bit[02]: Support Single-Range Output scheme;
  */
 #define INTEL_PT_MINIMAL_ECX     0x7
+/* generated packets which contain IP payloads have LIP values */
+#define INTEL_PT_IP_LIP          (1 << 31)
 #define INTEL_PT_ADDR_RANGES_NUM 0x2 /* Number of configurable address ranges */
 #define INTEL_PT_ADDR_RANGES_NUM_MASK 0x3
 #define INTEL_PT_MTC_BITMAP      (0x0249 << 16) /* Support ART(0,3,6,9) */
@@ -293,6 +295,8 @@ typedef struct FeatureWordInfo {
     uint32_t tcg_features; /* Feature flags supported by TCG */
     uint32_t unmigratable_flags; /* Feature flags known to be unmigratable */
     uint32_t migratable_flags; /* Feature flags known to be migratable */
+    /* Features that shouldn't be auto-enabled by "-cpu host" */
+    uint32_t no_autoenable_flags;
 } FeatureWordInfo;
 
 static FeatureWordInfo feature_word_info[FEATURE_WORDS] = {
@@ -398,6 +402,11 @@ static FeatureWordInfo feature_word_info[FEATURE_WORDS] = {
         },
         .cpuid_eax = KVM_CPUID_FEATURES, .cpuid_reg = R_EDX,
         .tcg_features = TCG_KVM_FEATURES,
+        /*
+         * KVM hints aren't auto-enabled by -cpu host, they need to be
+         * explicitly enabled in the command-line.
+         */
+        .no_autoenable_flags = ~0U,
     },
     [FEAT_HYPERV_EAX] = {
         .feat_names = {
@@ -501,7 +510,7 @@ static FeatureWordInfo feature_word_info[FEATURE_WORDS] = {
             NULL, NULL, NULL, NULL,
             NULL, NULL, NULL, NULL,
             NULL, NULL, "spec-ctrl", NULL,
-            NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, "ssbd",
         },
         .cpuid_eax = 7,
         .cpuid_needs_ecx = true, .cpuid_ecx = 0,
@@ -532,7 +541,7 @@ static FeatureWordInfo feature_word_info[FEATURE_WORDS] = {
             "ibpb", NULL, NULL, NULL,
             NULL, NULL, NULL, NULL,
             NULL, NULL, NULL, NULL,
-            NULL, NULL, NULL, NULL,
+            NULL, "virt-ssbd", NULL, NULL,
             NULL, NULL, NULL, NULL,
         },
         .cpuid_eax = 0x80000008,
@@ -781,13 +790,7 @@ static char *x86_cpu_type_name(const char *model_name)
 static ObjectClass *x86_cpu_class_by_name(const char *cpu_model)
 {
     ObjectClass *oc;
-    char *typename;
-
-    if (cpu_model == NULL) {
-        return NULL;
-    }
-
-    typename = x86_cpu_type_name(cpu_model);
+    char *typename = x86_cpu_type_name(cpu_model);
     oc = object_class_by_name(typename);
     g_free(typename);
     return oc;
@@ -3141,7 +3144,7 @@ arch_query_cpu_model_expansion(CpuModelExpansionType type,
 
     xc = x86_cpu_from_model(model->name,
                             model->has_props ?
-                                qobject_to_qdict(model->props) :
+                                qobject_to(QDict, model->props) :
                                 NULL, &err);
     if (err) {
         goto out;
@@ -4066,7 +4069,8 @@ static void x86_cpu_expand_features(X86CPU *cpu, Error **errp)
              */
             env->features[w] |=
                 x86_cpu_get_supported_feature_word(w, cpu->migratable) &
-                ~env->user_features[w];
+                ~env->user_features[w] & \
+                ~feature_word_info[w].no_autoenable_flags;
         }
     }
 
@@ -4173,7 +4177,8 @@ static int x86_cpu_filter_features(X86CPU *cpu)
            ((eax_1 & INTEL_PT_ADDR_RANGES_NUM_MASK) <
                                            INTEL_PT_ADDR_RANGES_NUM) ||
            ((ebx_1 & (INTEL_PT_PSB_BITMAP | INTEL_PT_CYCLE_BITMAP)) !=
-                (INTEL_PT_PSB_BITMAP | INTEL_PT_CYCLE_BITMAP))) {
+                (INTEL_PT_PSB_BITMAP | INTEL_PT_CYCLE_BITMAP)) ||
+           (ecx_0 & INTEL_PT_IP_LIP)) {
             /*
              * Processor Trace capabilities aren't configurable, so if the
              * host can't emulate the capabilities we report on
@@ -4764,6 +4769,7 @@ static Property x86_cpu_properties[] = {
     DEFINE_PROP_BOOL("hv-runtime", X86CPU, hyperv_runtime, false),
     DEFINE_PROP_BOOL("hv-synic", X86CPU, hyperv_synic, false),
     DEFINE_PROP_BOOL("hv-stimer", X86CPU, hyperv_stimer, false),
+    DEFINE_PROP_BOOL("hv-frequencies", X86CPU, hyperv_frequencies, false),
     DEFINE_PROP_BOOL("check", X86CPU, check_cpuid, true),
     DEFINE_PROP_BOOL("enforce", X86CPU, enforce_cpuid, false),
     DEFINE_PROP_BOOL("kvm", X86CPU, expose_kvm, true),

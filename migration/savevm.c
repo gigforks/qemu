@@ -1029,6 +1029,11 @@ int qemu_savevm_state_iterate(QEMUFile *f, bool postcopy)
                 continue;
             }
         }
+        if (se->ops && se->ops->is_active_iterate) {
+            if (!se->ops->is_active_iterate(se->opaque)) {
+                continue;
+            }
+        }
         /*
          * In the postcopy phase, any device that doesn't know how to
          * do postcopy should have saved it's state in the _complete
@@ -1221,13 +1226,15 @@ int qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only,
  * for units that can't do postcopy.
  */
 void qemu_savevm_state_pending(QEMUFile *f, uint64_t threshold_size,
-                               uint64_t *res_non_postcopiable,
-                               uint64_t *res_postcopiable)
+                               uint64_t *res_precopy_only,
+                               uint64_t *res_compatible,
+                               uint64_t *res_postcopy_only)
 {
     SaveStateEntry *se;
 
-    *res_non_postcopiable = 0;
-    *res_postcopiable = 0;
+    *res_precopy_only = 0;
+    *res_compatible = 0;
+    *res_postcopy_only = 0;
 
 
     QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
@@ -1240,7 +1247,8 @@ void qemu_savevm_state_pending(QEMUFile *f, uint64_t threshold_size,
             }
         }
         se->ops->save_live_pending(f, se->opaque, threshold_size,
-                                   res_non_postcopiable, res_postcopiable);
+                                   res_precopy_only, res_compatible,
+                                   res_postcopy_only);
     }
 }
 
@@ -1387,6 +1395,7 @@ static int loadvm_postcopy_handle_advise(MigrationIncomingState *mis,
 {
     PostcopyState ps = postcopy_state_set(POSTCOPY_INCOMING_ADVISE);
     uint64_t remote_pagesize_summary, local_pagesize_summary, remote_tps;
+    Error *local_err = NULL;
 
     trace_loadvm_postcopy_handle_advise();
     if (ps != POSTCOPY_INCOMING_NONE) {
@@ -1449,6 +1458,11 @@ static int loadvm_postcopy_handle_advise(MigrationIncomingState *mis,
          */
         error_report("Postcopy needs matching target page sizes (s=%d d=%zd)",
                      (int)remote_tps, qemu_target_page_size());
+        return -1;
+    }
+
+    if (postcopy_notify(POSTCOPY_NOTIFY_INBOUND_ADVISE, &local_err)) {
+        error_report_err(local_err);
         return -1;
     }
 
@@ -1613,6 +1627,8 @@ static int loadvm_postcopy_handle_listen(MigrationIncomingState *mis)
 {
     PostcopyState ps = postcopy_state_set(POSTCOPY_INCOMING_LISTENING);
     trace_loadvm_postcopy_handle_listen();
+    Error *local_err = NULL;
+
     if (ps != POSTCOPY_INCOMING_ADVISE && ps != POSTCOPY_INCOMING_DISCARD) {
         error_report("CMD_POSTCOPY_LISTEN in wrong postcopy state (%d)", ps);
         return -1;
@@ -1636,6 +1652,11 @@ static int loadvm_postcopy_handle_listen(MigrationIncomingState *mis)
         if (postcopy_ram_enable_notify(mis)) {
             return -1;
         }
+    }
+
+    if (postcopy_notify(POSTCOPY_NOTIFY_INBOUND_LISTEN, &local_err)) {
+        error_report_err(local_err);
+        return -1;
     }
 
     if (mis->have_listen_thread) {
@@ -1685,6 +1706,8 @@ static void loadvm_postcopy_handle_run_bh(void *opaque)
     cpu_synchronize_all_post_init();
 
     trace_loadvm_postcopy_handle_run_vmstart();
+
+    dirty_bitmap_mig_before_vm_start();
 
     if (autostart) {
         /* Hold onto your hats, starting the CPU */

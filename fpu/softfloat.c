@@ -602,34 +602,42 @@ static FloatParts pick_nan(FloatParts a, FloatParts b, float_status *s)
 static FloatParts pick_nan_muladd(FloatParts a, FloatParts b, FloatParts c,
                                   bool inf_zero, float_status *s)
 {
+    int which;
+
     if (is_snan(a.cls) || is_snan(b.cls) || is_snan(c.cls)) {
         s->float_exception_flags |= float_flag_invalid;
     }
 
-    if (s->default_nan_mode) {
-        a.cls = float_class_dnan;
-    } else {
-        switch (pickNaNMulAdd(is_qnan(a.cls), is_snan(a.cls),
-                              is_qnan(b.cls), is_snan(b.cls),
-                              is_qnan(c.cls), is_snan(c.cls),
-                              inf_zero, s)) {
-        case 0:
-            break;
-        case 1:
-            a = b;
-            break;
-        case 2:
-            a = c;
-            break;
-        case 3:
-            a.cls = float_class_dnan;
-            return a;
-        default:
-            g_assert_not_reached();
-        }
+    which = pickNaNMulAdd(is_qnan(a.cls), is_snan(a.cls),
+                          is_qnan(b.cls), is_snan(b.cls),
+                          is_qnan(c.cls), is_snan(c.cls),
+                          inf_zero, s);
 
-        a.cls = float_class_msnan;
+    if (s->default_nan_mode) {
+        /* Note that this check is after pickNaNMulAdd so that function
+         * has an opportunity to set the Invalid flag.
+         */
+        a.cls = float_class_dnan;
+        return a;
     }
+
+    switch (which) {
+    case 0:
+        break;
+    case 1:
+        a = b;
+        break;
+    case 2:
+        a = c;
+        break;
+    case 3:
+        a.cls = float_class_dnan;
+        return a;
+    default:
+        g_assert_not_reached();
+    }
+    a.cls = float_class_msnan;
+
     return a;
 }
 
@@ -1146,15 +1154,15 @@ static FloatParts div_floats(FloatParts a, FloatParts b, float_status *s)
         a.cls = float_class_dnan;
         return a;
     }
+    /* Inf / x or 0 / x */
+    if (a.cls == float_class_inf || a.cls == float_class_zero) {
+        a.sign = sign;
+        return a;
+    }
     /* Div 0 => Inf */
     if (b.cls == float_class_zero) {
         s->float_exception_flags |= float_flag_divbyzero;
         a.cls = float_class_inf;
-        a.sign = sign;
-        return a;
-    }
-    /* Inf / x or 0 / x */
-    if (a.cls == float_class_inf || a.cls == float_class_zero) {
         a.sign = sign;
         return a;
     }
@@ -1344,8 +1352,10 @@ static int64_t round_to_int_and_pack(FloatParts in, int rmode,
     case float_class_qnan:
     case float_class_dnan:
     case float_class_msnan:
+        s->float_exception_flags = orig_flags | float_flag_invalid;
         return max;
     case float_class_inf:
+        s->float_exception_flags = orig_flags | float_flag_invalid;
         return p.sign ? min : max;
     case float_class_zero:
         return 0;
@@ -1358,14 +1368,14 @@ static int64_t round_to_int_and_pack(FloatParts in, int rmode,
             r = UINT64_MAX;
         }
         if (p.sign) {
-            if (r < -(uint64_t) min) {
+            if (r <= -(uint64_t) min) {
                 return -r;
             } else {
                 s->float_exception_flags = orig_flags | float_flag_invalid;
                 return min;
             }
         } else {
-            if (r < max) {
+            if (r <= max) {
                 return r;
             } else {
                 s->float_exception_flags = orig_flags | float_flag_invalid;
@@ -1437,6 +1447,7 @@ static uint64_t round_to_uint_and_pack(FloatParts in, int rmode, uint64_t max,
         s->float_exception_flags = orig_flags | float_flag_invalid;
         return max;
     case float_class_inf:
+        s->float_exception_flags = orig_flags | float_flag_invalid;
         return p.sign ? 0 : max;
     case float_class_zero:
         return 0;
@@ -1486,8 +1497,8 @@ uint ## isz ## _t float ## fsz ## _to_uint ## isz ## _round_to_zero     \
  (float ## fsz a, float_status *s)                                      \
 {                                                                       \
     FloatParts p = float ## fsz ## _unpack_canonical(a, s);             \
-    return round_to_uint_and_pack(p, s->float_rounding_mode,            \
-                                 UINT ## isz ## _MAX, s);               \
+    return round_to_uint_and_pack(p, float_round_to_zero,               \
+                                  UINT ## isz ## _MAX, s);              \
 }
 
 FLOAT_TO_UINT(16, 16)
@@ -1704,7 +1715,6 @@ static FloatParts minmax_floats(FloatParts a, FloatParts b, bool ismin,
         return pick_nan(a, b, s);
     } else {
         int a_exp, b_exp;
-        bool a_sign, b_sign;
 
         switch (a.cls) {
         case float_class_normal:
@@ -1735,20 +1745,22 @@ static FloatParts minmax_floats(FloatParts a, FloatParts b, bool ismin,
             break;
         }
 
-        a_sign = a.sign;
-        b_sign = b.sign;
-        if (ismag) {
-            a_sign = b_sign = 0;
-        }
-
-        if (a_sign == b_sign) {
+        if (ismag && (a_exp != b_exp || a.frac != b.frac)) {
             bool a_less = a_exp < b_exp;
             if (a_exp == b_exp) {
                 a_less = a.frac < b.frac;
             }
-            return a_sign ^ a_less ^ ismin ? b : a;
+            return a_less ^ ismin ? b : a;
+        }
+
+        if (a.sign == b.sign) {
+            bool a_less = a_exp < b_exp;
+            if (a_exp == b_exp) {
+                a_less = a.frac < b.frac;
+            }
+            return a.sign ^ a_less ^ ismin ? b : a;
         } else {
-            return a_sign ^ ismin ? b : a;
+            return a.sign ^ ismin ? b : a;
         }
     }
 }
@@ -1874,6 +1886,12 @@ static FloatParts scalbn_decomposed(FloatParts a, int n, float_status *s)
         return return_nan(a, s);
     }
     if (a.cls == float_class_normal) {
+        /* The largest float type (even though not supported by FloatParts)
+         * is float128, which has a 15 bit exponent.  Bounding N to 16 bits
+         * still allows rounding to infinity, without allowing overflow
+         * within the int32_t that backs FloatParts.exp.
+         */
+        n = MIN(MAX(n, -0x10000), 0x10000);
         a.exp += n;
     }
     return a;
@@ -3129,7 +3147,7 @@ float128 uint64_to_float128(uint64_t a, float_status *status)
     if (a == 0) {
         return float128_zero;
     }
-    return normalizeRoundAndPackFloat128(0, 0x406E, a, 0, status);
+    return normalizeRoundAndPackFloat128(0, 0x406E, 0, a, status);
 }
 
 

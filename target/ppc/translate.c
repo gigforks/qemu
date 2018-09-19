@@ -4526,7 +4526,7 @@ static void gen_tlbie(DisasContext *ctx)
     TCGv_i32 t1;
 
     if (ctx->gtse) {
-        CHK_SV; /* If gtse is set then tblie is supervisor privileged */
+        CHK_SV; /* If gtse is set then tlbie is supervisor privileged */
     } else {
         CHK_HV; /* Else hypervisor privileged */
     }
@@ -4553,7 +4553,12 @@ static void gen_tlbsync(DisasContext *ctx)
 #if defined(CONFIG_USER_ONLY)
     GEN_PRIV;
 #else
-    CHK_HV;
+
+    if (ctx->gtse) {
+        CHK_SV; /* If gtse is set then tlbsync is supervisor privileged */
+    } else {
+        CHK_HV; /* Else hypervisor privileged */
+    }
 
     /* BookS does both ptesync and tlbsync make tlbsync a nop for server */
     if (ctx->insns_flags & PPC_BOOKE) {
@@ -7232,10 +7237,9 @@ static int ppc_tr_init_disas_context(DisasContextBase *dcbase,
     ctx->sf_mode = msr_is_64bit(env, env->msr);
     ctx->has_cfar = !!(env->flags & POWERPC_FLAG_CFAR);
 #endif
-    if (env->mmu_model == POWERPC_MMU_32B ||
-        env->mmu_model == POWERPC_MMU_601 ||
-        (env->mmu_model & POWERPC_MMU_64B))
-            ctx->lazy_tlb_flush = true;
+    ctx->lazy_tlb_flush = env->mmu_model == POWERPC_MMU_32B
+        || env->mmu_model == POWERPC_MMU_601
+        || (env->mmu_model & POWERPC_MMU_64B);
 
     ctx->fpu_enabled = !!msr_fp;
     if ((env->flags & POWERPC_FLAG_SPE) && msr_spe)
@@ -7292,6 +7296,7 @@ static bool ppc_tr_breakpoint_check(DisasContextBase *dcbase, CPUState *cs,
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
 
     gen_debug_exception(ctx);
+    dcbase->is_jmp = DISAS_NORETURN;
     /* The address covered by the breakpoint must be included in
        [tb->pc, tb->pc + tb->size) in order to for it to be
        properly cleared -- thus we increment the PC here so that

@@ -293,6 +293,14 @@ TCGLabel *gen_new_label(void)
     return l;
 }
 
+static void set_jmp_reset_offset(TCGContext *s, int which)
+{
+    size_t off = tcg_current_code_size(s);
+    s->tb_jmp_reset_offset[which] = off;
+    /* Make sure that we didn't overflow the stored offset.  */
+    assert(s->tb_jmp_reset_offset[which] == off);
+}
+
 #include "tcg-target.inc.c"
 
 static void tcg_region_bounds(size_t curr_region, void **pstart, void **pend)
@@ -866,6 +874,7 @@ void tcg_func_start(TCGContext *s)
     /* No temps have been previously allocated for size or locality.  */
     memset(s->free_temps, 0, sizeof(s->free_temps));
 
+    s->nb_ops = 0;
     s->nb_labels = 0;
     s->current_frame_offset = s->frame_start;
 
@@ -1983,6 +1992,7 @@ void tcg_op_remove(TCGContext *s, TCGOp *op)
 {
     QTAILQ_REMOVE(&s->ops, op, link);
     QTAILQ_INSERT_TAIL(&s->free_ops, op, link);
+    s->nb_ops--;
 
 #ifdef CONFIG_PROFILER
     atomic_set(&s->prof.del_op_count, s->prof.del_op_count + 1);
@@ -2002,6 +2012,7 @@ static TCGOp *tcg_op_alloc(TCGOpcode opc)
     }
     memset(op, 0, offsetof(TCGOp, link));
     op->opc = opc;
+    s->nb_ops++;
 
     return op;
 }
@@ -3351,7 +3362,10 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
             break;
         case INDEX_op_insn_start:
             if (num_insns >= 0) {
-                s->gen_insn_end_off[num_insns] = tcg_current_code_size(s);
+                size_t off = tcg_current_code_size(s);
+                s->gen_insn_end_off[num_insns] = off;
+                /* Assert that we do not overflow our stored offset.  */
+                assert(s->gen_insn_end_off[num_insns] == off);
             }
             num_insns++;
             for (i = 0; i < TARGET_INSN_START_WORDS; ++i) {

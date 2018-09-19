@@ -370,6 +370,11 @@ void qmp_screendump(const char *filename, bool has_device, const char *device,
 
     graphic_hw_update(con);
     surface = qemu_console_surface(con);
+    if (!surface) {
+        error_setg(errp, "no surface");
+        return;
+    }
+
     ppm_save(filename, surface, errp);
 }
 
@@ -1191,11 +1196,22 @@ static const int qcode_to_keysym[Q_KEY_CODE__MAX] = {
     [Q_KEY_CODE_BACKSPACE] = QEMU_KEY_BACKSPACE,
 };
 
-bool kbd_put_qcode_console(QemuConsole *s, int qcode)
+static const int ctrl_qcode_to_keysym[Q_KEY_CODE__MAX] = {
+    [Q_KEY_CODE_UP]     = QEMU_KEY_CTRL_UP,
+    [Q_KEY_CODE_DOWN]   = QEMU_KEY_CTRL_DOWN,
+    [Q_KEY_CODE_RIGHT]  = QEMU_KEY_CTRL_RIGHT,
+    [Q_KEY_CODE_LEFT]   = QEMU_KEY_CTRL_LEFT,
+    [Q_KEY_CODE_HOME]   = QEMU_KEY_CTRL_HOME,
+    [Q_KEY_CODE_END]    = QEMU_KEY_CTRL_END,
+    [Q_KEY_CODE_PGUP]   = QEMU_KEY_CTRL_PAGEUP,
+    [Q_KEY_CODE_PGDN]   = QEMU_KEY_CTRL_PAGEDOWN,
+};
+
+bool kbd_put_qcode_console(QemuConsole *s, int qcode, bool ctrl)
 {
     int keysym;
 
-    keysym = qcode_to_keysym[qcode];
+    keysym = ctrl ? ctrl_qcode_to_keysym[qcode] : qcode_to_keysym[qcode];
     if (keysym == 0) {
         return false;
     }

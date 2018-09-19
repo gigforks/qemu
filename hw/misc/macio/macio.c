@@ -115,6 +115,13 @@ static void macio_common_realize(PCIDevice *d, Error **errp)
     memory_region_add_subregion(&s->bar, 0x16000,
                                 sysbus_mmio_get_region(sysbus_dev, 0));
 
+    qdev_prop_set_uint32(DEVICE(&s->escc), "disabled", 0);
+    qdev_prop_set_uint32(DEVICE(&s->escc), "frequency", ESCC_CLOCK);
+    qdev_prop_set_uint32(DEVICE(&s->escc), "it_shift", 4);
+    qdev_prop_set_chr(DEVICE(&s->escc), "chrA", serial_hds[0]);
+    qdev_prop_set_chr(DEVICE(&s->escc), "chrB", serial_hds[1]);
+    qdev_prop_set_uint32(DEVICE(&s->escc), "chnBtype", escc_serial);
+    qdev_prop_set_uint32(DEVICE(&s->escc), "chnAtype", escc_serial);
     object_property_set_bool(OBJECT(&s->escc), true, "realized", &err);
     if (err) {
         error_propagate(errp, err);
@@ -341,13 +348,6 @@ static void macio_instance_init(Object *obj)
     object_property_add_child(obj, "dbdma", OBJECT(&s->dbdma), NULL);
 
     object_initialize(&s->escc, sizeof(s->escc), TYPE_ESCC);
-    qdev_prop_set_uint32(DEVICE(&s->escc), "disabled", 0);
-    qdev_prop_set_uint32(DEVICE(&s->escc), "frequency", ESCC_CLOCK);
-    qdev_prop_set_uint32(DEVICE(&s->escc), "it_shift", 4);
-    qdev_prop_set_chr(DEVICE(&s->escc), "chrA", serial_hds[0]);
-    qdev_prop_set_chr(DEVICE(&s->escc), "chrB", serial_hds[1]);
-    qdev_prop_set_uint32(DEVICE(&s->escc), "chnBtype", escc_serial);
-    qdev_prop_set_uint32(DEVICE(&s->escc), "chnAtype", escc_serial);
     qdev_set_parent_bus(DEVICE(&s->escc), sysbus_get_default());
     object_property_add_child(obj, "escc", OBJECT(&s->escc), NULL);
 }
@@ -406,6 +406,8 @@ static void macio_class_init(ObjectClass *klass, void *data)
     k->class_id = PCI_CLASS_OTHERS << 8;
     dc->props = macio_properties;
     set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
+    /* Reason: Uses serial_hds in macio_instance_init */
+    dc->user_creatable = false;
 }
 
 static const TypeInfo macio_oldworld_type_info = {

@@ -655,6 +655,7 @@ struct TCGContext {
     int nb_globals;
     int nb_temps;
     int nb_indirects;
+    int nb_ops;
 
     /* goto_tb support */
     tcg_insn_unit *code_buf;
@@ -825,6 +826,16 @@ static inline void tcg_set_insn_param(TCGOp *op, int arg, TCGArg v)
     op->args[arg] = v;
 }
 
+static inline void tcg_set_insn_start_param(TCGOp *op, int arg, target_ulong v)
+{
+#if TARGET_LONG_BITS <= TCG_TARGET_REG_BITS
+    tcg_set_insn_param(op, arg, v);
+#else
+    tcg_set_insn_param(op, arg * 2, v);
+    tcg_set_insn_param(op, arg * 2 + 1, v >> 32);
+#endif
+}
+
 /* The last op that was emitted.  */
 static inline TCGOp *tcg_last_op(void)
 {
@@ -834,7 +845,14 @@ static inline TCGOp *tcg_last_op(void)
 /* Test for whether to terminate the TB for using too many opcodes.  */
 static inline bool tcg_op_buf_full(void)
 {
-    return false;
+    /* This is not a hard limit, it merely stops translation when
+     * we have produced "enough" opcodes.  We want to limit TB size
+     * such that a RISC host can reasonably use a 16-bit signed
+     * branch within the TB.  We also need to be mindful of the
+     * 16-bit unsigned offsets, TranslationBlock.jmp_reset_offset[]
+     * and TCGContext.gen_insn_end_off[].
+     */
+    return tcg_ctx->nb_ops >= 4000;
 }
 
 /* pool based memory allocation */

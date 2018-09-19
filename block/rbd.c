@@ -263,14 +263,14 @@ static int qemu_rbd_set_keypairs(rados_t cluster, const char *keypairs_json,
     if (!keypairs_json) {
         return ret;
     }
-    keypairs = qobject_to_qlist(qobject_from_json(keypairs_json,
-                                                  &error_abort));
+    keypairs = qobject_to(QList,
+                          qobject_from_json(keypairs_json, &error_abort));
     remaining = qlist_size(keypairs) / 2;
     assert(remaining);
 
     while (remaining--) {
-        name = qobject_to_qstring(qlist_pop(keypairs));
-        value = qobject_to_qstring(qlist_pop(keypairs));
+        name = qobject_to(QString, qlist_pop(keypairs));
+        value = qobject_to(QString, qlist_pop(keypairs));
         assert(name && value);
         key = qstring_get_str(name);
 
@@ -623,6 +623,7 @@ static int qemu_rbd_open(BlockDriverState *bs, QDict *options, int flags,
     BlockdevOptionsRbd *opts = NULL;
     Visitor *v;
     QObject *crumpled = NULL;
+    const QDictEntry *e;
     Error *local_err = NULL;
     const char *filename;
     char *keypairs, *secretid;
@@ -669,6 +670,12 @@ static int qemu_rbd_open(BlockDriverState *bs, QDict *options, int flags,
         error_propagate(errp, local_err);
         r = -EINVAL;
         goto out;
+    }
+
+    /* Remove the processed options from the QDict (the visitor processes
+     * _all_ options in the QDict) */
+    while ((e = qdict_first(options))) {
+        qdict_del(options, e->key);
     }
 
     r = qemu_rbd_connect(&s->cluster, &s->io_ctx, opts,

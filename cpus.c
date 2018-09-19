@@ -892,11 +892,19 @@ void qemu_timer_notify_cb(void *opaque, QEMUClockType type)
         return;
     }
 
-    if (!qemu_in_vcpu_thread() && first_cpu) {
+    if (qemu_in_vcpu_thread()) {
+        /* A CPU is currently running; kick it back out to the
+         * tcg_cpu_exec() loop so it will recalculate its
+         * icount deadline immediately.
+         */
+        qemu_cpu_kick(current_cpu);
+    } else if (first_cpu) {
         /* qemu_cpu_kick is not enough to kick a halted CPU out of
          * qemu_tcg_wait_io_event.  async_run_on_cpu, instead,
          * causes cpu_thread_is_idle to return false.  This way,
          * handle_icount_deadline can run.
+         * If we have no CPUs at all for some reason, we don't
+         * need to do anything.
          */
         async_run_on_cpu(first_cpu, do_nothing, RUN_ON_CPU_NULL);
     }
@@ -1640,7 +1648,7 @@ static void *qemu_tcg_cpu_thread_fn(void *arg)
     /* process any pending work */
     cpu->exit_request = 1;
 
-    while (1) {
+    do {
         if (cpu_can_run(cpu)) {
             int r;
             qemu_mutex_unlock_iothread();
@@ -2210,11 +2218,25 @@ CpuInfoFastList *qmp_query_cpus_fast(Error **errp)
             info->value->props = props;
         }
 
-#if defined(TARGET_S390X)
+#if defined(TARGET_I386)
+        info->value->arch = CPU_INFO_ARCH_X86;
+#elif defined(TARGET_PPC)
+        info->value->arch = CPU_INFO_ARCH_PPC;
+#elif defined(TARGET_SPARC)
+        info->value->arch = CPU_INFO_ARCH_SPARC;
+#elif defined(TARGET_MIPS)
+        info->value->arch = CPU_INFO_ARCH_MIPS;
+#elif defined(TARGET_TRICORE)
+        info->value->arch = CPU_INFO_ARCH_TRICORE;
+#elif defined(TARGET_S390X)
         s390_cpu = S390_CPU(cpu);
         env = &s390_cpu->env;
         info->value->arch = CPU_INFO_ARCH_S390;
         info->value->u.s390.cpu_state = env->cpu_state;
+#elif defined(TARGET_RISCV)
+        info->value->arch = CPU_INFO_ARCH_RISCV;
+#else
+        info->value->arch = CPU_INFO_ARCH_OTHER;
 #endif
         if (!cur_item) {
             head = cur_item = info;

@@ -882,6 +882,30 @@ static void elf_core_copy_regs(target_elf_gregset_t *regs, const CPUMIPSState *e
 #define USE_ELF_CORE_DUMP
 #define ELF_EXEC_PAGESIZE        4096
 
+/* See arch/mips/include/uapi/asm/hwcap.h.  */
+enum {
+    HWCAP_MIPS_R6           = (1 << 0),
+    HWCAP_MIPS_MSA          = (1 << 1),
+};
+
+#define ELF_HWCAP get_elf_hwcap()
+
+static uint32_t get_elf_hwcap(void)
+{
+    MIPSCPU *cpu = MIPS_CPU(thread_cpu);
+    uint32_t hwcaps = 0;
+
+#define GET_FEATURE(flag, hwcap) \
+    do { if (cpu->env.insn_flags & (flag)) { hwcaps |= hwcap; } } while (0)
+
+    GET_FEATURE(ISA_MIPS32R6 | ISA_MIPS64R6, HWCAP_MIPS_R6);
+    GET_FEATURE(ASE_MSA, HWCAP_MIPS_MSA);
+
+#undef GET_FEATURE
+
+    return hwcaps;
+}
+
 #endif /* TARGET_MIPS */
 
 #ifdef TARGET_MICROBLAZE
@@ -1272,6 +1296,64 @@ static inline void init_thread(struct target_pt_regs *regs,
 }
 
 #endif /* TARGET_HPPA */
+
+#ifdef TARGET_XTENSA
+
+#define ELF_START_MMAP 0x20000000
+
+#define ELF_CLASS       ELFCLASS32
+#define ELF_ARCH        EM_XTENSA
+
+static inline void init_thread(struct target_pt_regs *regs,
+                               struct image_info *infop)
+{
+    regs->windowbase = 0;
+    regs->windowstart = 1;
+    regs->areg[1] = infop->start_stack;
+    regs->pc = infop->entry;
+}
+
+/* See linux kernel: arch/xtensa/include/asm/elf.h.  */
+#define ELF_NREG 128
+typedef target_elf_greg_t target_elf_gregset_t[ELF_NREG];
+
+enum {
+    TARGET_REG_PC,
+    TARGET_REG_PS,
+    TARGET_REG_LBEG,
+    TARGET_REG_LEND,
+    TARGET_REG_LCOUNT,
+    TARGET_REG_SAR,
+    TARGET_REG_WINDOWSTART,
+    TARGET_REG_WINDOWBASE,
+    TARGET_REG_THREADPTR,
+    TARGET_REG_AR0 = 64,
+};
+
+static void elf_core_copy_regs(target_elf_gregset_t *regs,
+                               const CPUXtensaState *env)
+{
+    unsigned i;
+
+    (*regs)[TARGET_REG_PC] = tswapreg(env->pc);
+    (*regs)[TARGET_REG_PS] = tswapreg(env->sregs[PS] & ~PS_EXCM);
+    (*regs)[TARGET_REG_LBEG] = tswapreg(env->sregs[LBEG]);
+    (*regs)[TARGET_REG_LEND] = tswapreg(env->sregs[LEND]);
+    (*regs)[TARGET_REG_LCOUNT] = tswapreg(env->sregs[LCOUNT]);
+    (*regs)[TARGET_REG_SAR] = tswapreg(env->sregs[SAR]);
+    (*regs)[TARGET_REG_WINDOWSTART] = tswapreg(env->sregs[WINDOW_START]);
+    (*regs)[TARGET_REG_WINDOWBASE] = tswapreg(env->sregs[WINDOW_BASE]);
+    (*regs)[TARGET_REG_THREADPTR] = tswapreg(env->uregs[THREADPTR]);
+    xtensa_sync_phys_from_window((CPUXtensaState *)env);
+    for (i = 0; i < env->config->nareg; ++i) {
+        (*regs)[TARGET_REG_AR0 + i] = tswapreg(env->phys_regs[i]);
+    }
+}
+
+#define USE_ELF_CORE_DUMP
+#define ELF_EXEC_PAGESIZE       4096
+
+#endif /* TARGET_XTENSA */
 
 #ifndef ELF_PLATFORM
 #define ELF_PLATFORM (NULL)
@@ -1831,6 +1913,55 @@ unsigned long init_guest_space(unsigned long host_start,
 
     /* Otherwise, a non-zero size region of memory needs to be mapped
      * and validated.  */
+
+#if defined(TARGET_ARM) && !defined(TARGET_AARCH64)
+    /* On 32-bit ARM, we need to map not just the usable memory, but
+     * also the commpage.  Try to find a suitable place by allocating
+     * a big chunk for all of it.  If host_start, then the naive
+     * strategy probably does good enough.
+     */
+    if (!host_start) {
+        unsigned long guest_full_size, host_full_size, real_start;
+
+        guest_full_size =
+            (0xffff0f00 & qemu_host_page_mask) + qemu_host_page_size;
+        host_full_size = guest_full_size - guest_start;
+        real_start = (unsigned long)
+            mmap(NULL, host_full_size, PROT_NONE, flags, -1, 0);
+        if (real_start == (unsigned long)-1) {
+            if (host_size < host_full_size - qemu_host_page_size) {
+                /* We failed to map a continous segment, but we're
+                 * allowed to have a gap between the usable memory and
+                 * the commpage where other things can be mapped.
+                 * This sparseness gives us more flexibility to find
+                 * an address range.
+                 */
+                goto naive;
+            }
+            return (unsigned long)-1;
+        }
+        munmap((void *)real_start, host_full_size);
+        if (real_start & ~qemu_host_page_mask) {
+            /* The same thing again, but with an extra qemu_host_page_size
+             * so that we can shift around alignment.
+             */
+            unsigned long real_size = host_full_size + qemu_host_page_size;
+            real_start = (unsigned long)
+                mmap(NULL, real_size, PROT_NONE, flags, -1, 0);
+            if (real_start == (unsigned long)-1) {
+                if (host_size < host_full_size - qemu_host_page_size) {
+                    goto naive;
+                }
+                return (unsigned long)-1;
+            }
+            munmap((void *)real_start, real_size);
+            real_start = HOST_PAGE_ALIGN(real_start);
+        }
+        current_start = real_start;
+    }
+ naive:
+#endif
+
     while (1) {
         unsigned long real_start, real_size, aligned_size;
         aligned_size = real_size = host_size;

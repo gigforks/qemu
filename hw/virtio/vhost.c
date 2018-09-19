@@ -342,6 +342,10 @@ static int vhost_verify_ring_mappings(struct vhost_dev *dev,
         "used ring"
     };
 
+    if (vhost_dev_has_iommu(dev)) {
+        return 0;
+    }
+
     for (i = 0; i < dev->nvqs; ++i) {
         struct vhost_virtqueue *vq = dev->vqs + i;
 
@@ -522,9 +526,27 @@ static void vhost_region_add_section(struct vhost_dev *dev,
     uint64_t mrs_gpa = section->offset_within_address_space;
     uintptr_t mrs_host = (uintptr_t)memory_region_get_ram_ptr(section->mr) +
                          section->offset_within_region;
+    RAMBlock *mrs_rb = section->mr->ram_block;
+    size_t mrs_page = qemu_ram_pagesize(mrs_rb);
 
     trace_vhost_region_add_section(section->mr->name, mrs_gpa, mrs_size,
                                    mrs_host);
+
+    /* Round the section to it's page size */
+    /* First align the start down to a page boundary */
+    uint64_t alignage = mrs_host & (mrs_page - 1);
+    if (alignage) {
+        mrs_host -= alignage;
+        mrs_size += alignage;
+        mrs_gpa  -= alignage;
+    }
+    /* Now align the size up to a page boundary */
+    alignage = mrs_size & (mrs_page - 1);
+    if (alignage) {
+        mrs_size += mrs_page - alignage;
+    }
+    trace_vhost_region_add_section_aligned(section->mr->name, mrs_gpa, mrs_size,
+                                           mrs_host);
 
     if (dev->n_tmp_sections) {
         /* Since we already have at least one section, lets see if
@@ -542,18 +564,51 @@ static void vhost_region_add_section(struct vhost_dev *dev,
                         prev_sec->offset_within_region;
         uint64_t prev_host_end   = range_get_last(prev_host_start, prev_size);
 
-        if (prev_gpa_end + 1 == mrs_gpa &&
-            prev_host_end + 1 == mrs_host &&
-            section->mr == prev_sec->mr &&
-            (!dev->vhost_ops->vhost_backend_can_merge ||
-                dev->vhost_ops->vhost_backend_can_merge(dev,
+        if (mrs_gpa <= (prev_gpa_end + 1)) {
+            /* OK, looks like overlapping/intersecting - it's possible that
+             * the rounding to page sizes has made them overlap, but they should
+             * match up in the same RAMBlock if they do.
+             */
+            if (mrs_gpa < prev_gpa_start) {
+                error_report("%s:Section rounded to %"PRIx64
+                             " prior to previous %"PRIx64,
+                             __func__, mrs_gpa, prev_gpa_start);
+                /* A way to cleanly fail here would be better */
+                return;
+            }
+            /* Offset from the start of the previous GPA to this GPA */
+            size_t offset = mrs_gpa - prev_gpa_start;
+
+            if (prev_host_start + offset == mrs_host &&
+                section->mr == prev_sec->mr &&
+                (!dev->vhost_ops->vhost_backend_can_merge ||
+                 dev->vhost_ops->vhost_backend_can_merge(dev,
                     mrs_host, mrs_size,
                     prev_host_start, prev_size))) {
-            /* The two sections abut */
-            need_add = false;
-            prev_sec->size = int128_add(prev_sec->size, section->size);
-            trace_vhost_region_add_section_abut(section->mr->name,
-                                                mrs_size + prev_size);
+                uint64_t max_end = MAX(prev_host_end, mrs_host + mrs_size);
+                need_add = false;
+                prev_sec->offset_within_address_space =
+                    MIN(prev_gpa_start, mrs_gpa);
+                prev_sec->offset_within_region =
+                    MIN(prev_host_start, mrs_host) -
+                    (uintptr_t)memory_region_get_ram_ptr(prev_sec->mr);
+                prev_sec->size = int128_make64(max_end - MIN(prev_host_start,
+                                               mrs_host));
+                trace_vhost_region_add_section_merge(section->mr->name,
+                                        int128_get64(prev_sec->size),
+                                        prev_sec->offset_within_address_space,
+                                        prev_sec->offset_within_region);
+            } else {
+                /* adjoining regions are fine, but overlapping ones with
+                 * different blocks/offsets shouldn't happen
+                 */
+                if (mrs_gpa != prev_gpa_end + 1) {
+                    error_report("%s: Overlapping but not coherent sections "
+                                 "at %"PRIx64,
+                                 __func__, mrs_gpa);
+                    return;
+                }
+            }
         }
     }
 
@@ -1177,7 +1232,7 @@ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
         if (!(hdev->features & (0x1ULL << VHOST_F_LOG_ALL))) {
             error_setg(&hdev->migration_blocker,
                        "Migration disabled: vhost lacks VHOST_F_LOG_ALL feature.");
-        } else if (vhost_dev_log_is_shared(hdev) && !qemu_memfd_check()) {
+        } else if (vhost_dev_log_is_shared(hdev) && !qemu_memfd_alloc_check()) {
             error_setg(&hdev->migration_blocker,
                        "Migration disabled: failed to allocate shared memory");
         }
@@ -1405,7 +1460,6 @@ int vhost_dev_set_config(struct vhost_dev *hdev, const uint8_t *data,
 void vhost_dev_set_config_notifier(struct vhost_dev *hdev,
                                    const VhostDevConfigOps *ops)
 {
-    assert(hdev->vhost_ops);
     hdev->config_ops = ops;
 }
 

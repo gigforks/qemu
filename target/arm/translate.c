@@ -1248,6 +1248,18 @@ static void gen_exception_insn(DisasContext *s, int offset, int excp,
     s->base.is_jmp = DISAS_NORETURN;
 }
 
+static void gen_exception_bkpt_insn(DisasContext *s, int offset, uint32_t syn)
+{
+    TCGv_i32 tcg_syn;
+
+    gen_set_condexec(s);
+    gen_set_pc_im(s, s->pc - offset);
+    tcg_syn = tcg_const_i32(syn);
+    gen_helper_exception_bkpt_insn(cpu_env, tcg_syn);
+    tcg_temp_free_i32(tcg_syn);
+    s->base.is_jmp = DISAS_NORETURN;
+}
+
 /* Force a TB lookup after an instruction that changes the CPU state.  */
 static inline void gen_lookup_tb(DisasContext *s)
 {
@@ -8774,9 +8786,7 @@ static void disas_arm_insn(DisasContext *s, unsigned int insn)
             case 1:
                 /* bkpt */
                 ARCH(5);
-                gen_exception_insn(s, 4, EXCP_BKPT,
-                                   syn_aa32_bkpt(imm16, false),
-                                   default_exception_el(s));
+                gen_exception_bkpt_insn(s, 4, syn_aa32_bkpt(imm16, false));
                 break;
             case 2:
                 /* Hypervisor call (v7) */
@@ -9227,11 +9237,14 @@ static void disas_arm_insn(DisasContext *s, unsigned int insn)
                             }
                         }
                         tcg_temp_free_i32(addr);
-                    } else {
+                    } else if ((insn & 0x00300f00) == 0) {
+                        /* 0bcccc_0001_0x00_xxxx_xxxx_0000_1001_xxxx
+                        *  - SWP, SWPB
+                        */
+
                         TCGv taddr;
                         TCGMemOp opc = s->be_data;
 
-                        /* SWP instruction */
                         rm = (insn) & 0xf;
 
                         if (insn & (1 << 22)) {
@@ -9249,6 +9262,8 @@ static void disas_arm_insn(DisasContext *s, unsigned int insn)
                                                 get_mem_index(s), opc);
                         tcg_temp_free(taddr);
                         store_reg(s, rd, tmp);
+                    } else {
+                        goto illegal_op;
                     }
                 }
             } else {
@@ -10768,8 +10783,23 @@ static void disas_thumb2_insn(DisasContext *s, uint32_t insn)
         /* Coprocessor.  */
         if (arm_dc_feature(s, ARM_FEATURE_M)) {
             /* We don't currently implement M profile FP support,
-             * so this entire space should give a NOCP fault.
+             * so this entire space should give a NOCP fault, with
+             * the exception of the v8M VLLDM and VLSTM insns, which
+             * must be NOPs in Secure state and UNDEF in Nonsecure state.
              */
+            if (arm_dc_feature(s, ARM_FEATURE_V8) &&
+                (insn & 0xffa00f00) == 0xec200a00) {
+                /* 0b1110_1100_0x1x_xxxx_xxxx_1010_xxxx_xxxx
+                 *  - VLLDM, VLSTM
+                 * We choose to UNDEF if the RAZ bits are non-zero.
+                 */
+                if (!s->v8m_secure || (insn & 0x0040f0ff)) {
+                    goto illegal_op;
+                }
+                /* Just NOP since FP support is not implemented */
+                break;
+            }
+            /* All other insns: NOCP */
             gen_exception_insn(s, 4, EXCP_NOCP, syn_uncategorized(),
                                default_exception_el(s));
             break;
@@ -11983,8 +12013,7 @@ static void disas_thumb_insn(DisasContext *s, uint32_t insn)
         {
             int imm8 = extract32(insn, 0, 8);
             ARCH(5);
-            gen_exception_insn(s, 2, EXCP_BKPT, syn_aa32_bkpt(imm8, true),
-                               default_exception_el(s));
+            gen_exception_bkpt_insn(s, 2, syn_aa32_bkpt(imm8, true));
             break;
         }
 
