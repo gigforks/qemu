@@ -759,7 +759,7 @@ static inline int zdb_write_block(zdb_aio_cb_t *acb, uint64_t blockid, void *pay
             continue;
         }
 
-        if(reply->type != REDIS_REPLY_STRING) {
+        if(reply->type != REDIS_REPLY_STRING && reply->type != REDIS_REPLY_NIL) {
             zdb_debug("[-] zdb: reply type: %d\n", reply->type);
             zdb_debug("[-] zdb: write: wrong response type from server\n");
 
